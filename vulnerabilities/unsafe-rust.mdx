@@ -1,0 +1,383 @@
+---
+title: "Unsafe Rust"
+description: "How unsafe pointer operations bypass Rust's safety guarantees in Solana programs"
+icon: "triangle-exclamation"
+---
+
+What happens when your program casts raw bytes to structs without validation?
+
+## What we will build
+
+- A Solana program that uses `unsafe` pointer casts to read account data, skipping every safety check Rust provides
+- A test that feeds a fake account into the vulnerable instruction and watches it blindly interpret garbage bytes as valid state
+- A fixed version (Anchor and Pinocchio) that replaces `unsafe` with typed deserialization and ownership checks
+
+<Note>
+**Prerequisites:** Anchor 0.30+, Solana CLI 1.18+, Node.js 18+. Clone the repo listed in [Run it yourself](#run-it-yourself) before starting.
+</Note>
+
+## The vulnerable program -- Anchor
+
+We need an account to store data. `DataStore` holds an authority, a numeric value, a label, and an initialization flag:
+
+```rust state.rs
+use anchor_lang::prelude::*;
+
+#[account]
+pub struct DataStore {
+    pub authority: Pubkey,
+    pub value: u64,
+    pub label: [u8; 32],
+    pub is_initialized: bool,
+}
+
+impl DataStore {
+    pub const LEN: usize = 8 + 32 + 8 + 32 + 1; // discriminator + pubkey + u64 + label + bool
+}
+```
+
+The `initialize` instruction creates the account normally using Anchor's typed `Account`:
+
+```rust initialize.rs
+use anchor_lang::prelude::*;
+use crate::state::DataStore;
+
+pub fn initialize(ctx: Context<Initialize>, value: u64, label: [u8; 32]) -> Result<()> {
+    let store = &mut ctx.accounts.store;
+    store.authority = ctx.accounts.authority.key();
+    store.value = value;
+    store.label = label;
+    store.is_initialized = true;
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = DataStore::LEN,
+        seeds = [b"store", authority.key().as_ref()],
+        bump
+    )]
+    pub store: Account<'info, DataStore>,
+
+    pub system_program: Program<'info, System>,
+}
+```
+
+Now the vulnerable `read_data`. Instead of `Account<'info, DataStore>`, we accept an `UncheckedAccount` and cast raw bytes through a pointer:
+
+```rust read_data.rs (vulnerable)
+use anchor_lang::prelude::*;
+
+pub fn read_data(ctx: Context<ReadData>) -> Result<()> {
+    let account_info = ctx.accounts.store.to_account_info();
+    let data = account_info.try_borrow_data()?;
+
+    let store_data = unsafe {
+        let raw_ptr = data.as_ptr().add(8) as *const RawDataStore;
+        &*raw_ptr
+    };
+
+    msg!("Authority: {:?}", store_data.authority);
+    msg!("Value: {}", store_data.value);
+
+    Ok(())
+}
+
+#[repr(C)]
+pub struct RawDataStore {
+    pub authority: [u8; 32],
+    pub value: u64,
+    pub label: [u8; 32],
+    pub is_initialized: u8,
+}
+
+#[derive(Accounts)]
+pub struct ReadData<'info> {
+    pub authority: Signer<'info>,
+
+    /// CHECK: INTENTIONALLY VULNERABLE - accepts any account for unsafe read
+    pub store: UncheckedAccount<'info>,
+}
+```
+
+Notice that `UncheckedAccount` performs zero validation. The `unsafe` block skips the discriminator check, ignores account ownership, and never verifies the data is long enough for a `RawDataStore`. Any account from any program can be passed here.
+
+The program dispatcher ties it together:
+
+```rust lib.rs
+use anchor_lang::prelude::*;
+
+declare_id!("HC7RbuKNEAZRx7WRhBgaBcYKeNr4fuaZwmo4V1LSCkGz");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod vulnerable_unsafe_rust {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>, value: u64, label: [u8; 32]) -> Result<()> {
+        instructions::initialize(ctx, value, label)
+    }
+
+    pub fn read_data(ctx: Context<ReadData>) -> Result<()> {
+        instructions::read_data(ctx)
+    }
+}
+```
+
+## Exploiting it
+
+An attacker creates a fake account owned by the System Program and passes it as `store`:
+
+```typescript
+const fakeAccount = Keypair.generate();
+
+const createAccountIx = SystemProgram.createAccount({
+  fromPubkey: attacker.publicKey,
+  newAccountPubkey: fakeAccount.publicKey,
+  lamports: await provider.connection.getMinimumBalanceForRentExemption(81),
+  space: 81,
+  programId: SystemProgram.programId, // NOT our program
+});
+```
+
+Then they call `read_data` with the fake account:
+
+```typescript
+await vulnerableProgram.methods
+  .readData()
+  .accounts({
+    authority: attacker.publicKey,
+    store: fakeAccount.publicKey,
+  })
+  .signers([attacker])
+  .rpc();
+```
+
+You will see the transaction succeed. The program interprets whatever bytes are at offsets 8-40 as the "authority" pubkey, bytes 40-48 as the "value", and so on. All zeros, all garbage -- the program has no idea.
+
+<Warning>
+The Solana BPF sandbox prevents `unsafe` reads from compromising the validator, but the program still misinterprets account data, skips authorization, and makes incorrect state transitions. The sandbox limits the blast radius, not the vulnerability.
+</Warning>
+
+## The fix -- Anchor
+
+We replace `UncheckedAccount` with `Account<'info, DataStore>`, drop all `unsafe` code, and add proper constraints:
+
+```rust read_data.rs (secure)
+use anchor_lang::prelude::*;
+use crate::state::DataStore;
+
+pub fn read_data(ctx: Context<ReadData>) -> Result<()> {
+    let store = &ctx.accounts.store;
+
+    require!(store.is_initialized, ErrorCode::NotInitialized);
+    require!(store.authority == ctx.accounts.authority.key(), ErrorCode::Unauthorized);
+
+    msg!("Authority: {}", store.authority);
+    msg!("Value: {}", store.value);
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct ReadData<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"store", authority.key().as_ref()],
+        bump,
+        has_one = authority,
+    )]
+    pub store: Account<'info, DataStore>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Account not initialized")]
+    NotInitialized,
+    #[msg("Unauthorized access")]
+    Unauthorized,
+}
+```
+
+Notice that the entire `unsafe` block, the `#[repr(C)]` struct, and the raw pointer arithmetic are gone. `Account<'info, DataStore>` validates the discriminator, checks program ownership, and deserializes with bounds checking -- all before our handler runs.
+
+Now if we re-run the attack:
+
+```typescript
+await secureProgram.methods
+  .readData()
+  .accounts({
+    authority: attacker.publicKey,
+    store: fakeAccount.publicKey,
+  })
+  .signers([attacker])
+  .rpc();
+```
+
+You will see the transaction fail with `AccountOwnedByWrongProgram` or a seed-derivation mismatch. The fake account is rejected before the instruction body executes.
+
+## The vulnerable program -- Pinocchio
+
+The Pinocchio version has the same pattern at a lower level. The `read_data` function skips ownership checks and casts raw bytes through a pointer:
+
+```rust lib.rs (vulnerable -- read_data only)
+fn read_data(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, store_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !authority_info.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
+
+    let data = store_info.try_borrow()?;
+
+    unsafe {
+        let ptr = data.as_ptr() as *const DataStoreRaw;
+        let _raw = &*ptr;
+    }
+
+    Ok(())
+}
+
+#[repr(C)]
+struct DataStoreRaw {
+    authority: [u8; 32],
+    value: u64,
+    label: [u8; 32],
+    is_initialized: u8,
+}
+```
+
+Notice that `owned_by(&ID)` is absent, there is no length check, and no field validation. Any account's bytes get cast directly to `DataStoreRaw`.
+
+## The fix -- Pinocchio
+
+The secure version eliminates `unsafe` and validates at every step:
+
+```rust lib.rs (secure -- read_data only)
+fn read_data(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, store_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    if !authority_info.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
+
+    if !store_info.owned_by(&ID) { return Err(ProgramError::InvalidAccountOwner); }
+
+    let data = store_info.try_borrow()?;
+    let store = DataStore::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    if store.is_initialized != 1 { return Err(ProgramError::UninitializedAccount); }
+
+    if store.authority != *authority_info.address() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Ok(())
+}
+```
+
+You will see four new checks layered in: ownership (`owned_by`), bounds-checked deserialization (`DataStore::deserialize` checks `data.len() < Self::LEN`), initialization validation, and authority matching. Zero `unsafe` code.
+
+## Side-by-side comparison
+
+<Tabs>
+  <Tab title="Anchor">
+    **Vulnerable:**
+    ```rust
+    #[derive(Accounts)]
+    pub struct ReadData<'info> {
+        pub authority: Signer<'info>,
+        /// CHECK: INTENTIONALLY VULNERABLE
+        pub store: UncheckedAccount<'info>,
+    }
+
+    // Handler:
+    let raw_ptr = data.as_ptr().add(8) as *const RawDataStore;
+    let store_data = unsafe { &*raw_ptr };
+    ```
+
+    **Secure:**
+    ```rust
+    #[derive(Accounts)]
+    pub struct ReadData<'info> {
+        pub authority: Signer<'info>,
+        #[account(
+            seeds = [b"store", authority.key().as_ref()],
+            bump,
+            has_one = authority,
+        )]
+        pub store: Account<'info, DataStore>,
+    }
+
+    // Handler:
+    let store = &ctx.accounts.store;
+    require!(store.is_initialized, ErrorCode::NotInitialized);
+    ```
+  </Tab>
+
+  <Tab title="Pinocchio">
+    **Vulnerable:**
+    ```rust
+    let data = store_info.try_borrow()?;
+    unsafe {
+        let ptr = data.as_ptr() as *const DataStoreRaw;
+        let _raw = &*ptr;
+    }
+    ```
+
+    **Secure:**
+    ```rust
+    if !store_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    let data = store_info.try_borrow()?;
+    let store = DataStore::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if store.is_initialized != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+    if store.authority != *authority_info.address() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    ```
+
+    Without a framework safety net, we must check ownership, deserialize safely, and validate every field ourselves.
+  </Tab>
+</Tabs>
+
+## Key takeaways
+
+- **Never use `unsafe` to deserialize account data.** Safe deserialization with bounds checks costs negligible performance and closes the entire vulnerability class.
+- **In Anchor, use `Account<'info, T>` for every account you read.** It validates the discriminator, ownership, and data length before your handler runs.
+- **In Pinocchio, always check `owned_by` before reading.** Then use a `deserialize` function that verifies `data.len() >= LEN` before touching any bytes.
+- **`unsafe` compounds with missing ownership checks.** Even safe deserialization is useless if an attacker can pass any account they control.
+- **`#[repr(C)]` guarantees layout, not correctness.** A predictable memory layout does not mean the bytes at that address are valid.
+
+## Run it yourself
+
+```bash
+git clone https://github.com/danielAsaboro/solana_badger
+cd solana_badger
+npm install
+
+# Anchor tests (vulnerable + secure)
+anchor test -- --grep "Unsafe Rust"
+
+# Pinocchio tests
+npx jest tests/pinocchio/unsafe-rust.pinocchio.test.ts
+```
+
+The Anchor exploit test creates a fake System Program-owned account, passes it to `read_data`, and succeeds -- confirming the vulnerability. The secure test repeats the same attack and expects rejection.
+
+The Pinocchio exploit test does the same via bankrun: a zero-filled account owned by the System Program is accepted by the vulnerable program but rejected by the secure one with an ownership error.

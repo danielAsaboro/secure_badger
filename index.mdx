@@ -8,7 +8,7 @@ description: "Learn Solana security by example with vulnerable and secure progra
 Master Solana program security by studying real vulnerabilities, their exploits, and proven fixes. Every example includes implementations in both **Anchor** and **Pinocchio** frameworks.
 
 <CardGroup cols={3}>
-  <Card title="6 Vulnerabilities" icon="shield-halved">
+  <Card title="12 Vulnerabilities" icon="shield-halved">
     Critical security issues with real exploits and fixes
   </Card>
   <Card title="Both Frameworks" icon="code">
@@ -82,27 +82,45 @@ This reference teaches you to:
 ### 🟠 CPI Vulnerabilities (Critical & Rare)
 *Less common, but devastating when exploited.*
 
-<CardGroup cols={1}>
+<CardGroup cols={2}>
   <Card title="Arbitrary CPI" icon="arrows-rotate" href="/vulnerabilities/arbitrary-cpi">
     "Safe program?" - Malicious program invocation
+  </Card>
+  <Card title="Closing Accounts" icon="xmark" href="/vulnerabilities/closing-accounts">
+    "Data zeroed?" - Account revival after close
   </Card>
 </CardGroup>
 
 ### 🟡 PDAs & Arithmetic (Medium & Common)
 *Subtle bugs that add up over time.*
 
-<CardGroup cols={1}>
+<CardGroup cols={3}>
   <Card title="PDA Sharing" icon="share-nodes" href="/vulnerabilities/pda-sharing">
     "Unique seeds?" - Cross-user authority exploitation
+  </Card>
+  <Card title="Bump Seed Canonicalization" icon="seedling" href="/vulnerabilities/bump-seed-canonicalization">
+    "Canonical bump?" - Non-canonical PDA derivation
+  </Card>
+  <Card title="Integer Overflow" icon="calculator" href="/vulnerabilities/integer-overflow">
+    "Checked math?" - Silent wrapping arithmetic
   </Card>
 </CardGroup>
 
 ### 🟢 Rust & Lifecycle (Low & Rare)
 *Rust helps prevent most of these.*
 
-<CardGroup cols={1}>
+<CardGroup cols={2}>
   <Card title="Reinitialization" icon="repeat" href="/vulnerabilities/reinitialization-attacks">
     "Already init?" - Account state overwrite
+  </Card>
+  <Card title="Unsafe Rust" icon="triangle-exclamation" href="/vulnerabilities/unsafe-rust">
+    "Safe memory?" - Raw pointer misuse
+  </Card>
+  <Card title="Panic Handling" icon="bomb" href="/vulnerabilities/panic-handling">
+    "Graceful error?" - Unwrap and index panics
+  </Card>
+  <Card title="Dependency Security" icon="box" href="/vulnerabilities/dependency-security">
+    "Trusted crate?" - Supply chain risks
   </Card>
 </CardGroup>
 
@@ -111,8 +129,8 @@ This reference teaches you to:
 <Steps>
   <Step title="Clone the Repository">
     ```bash
-    git clone https://github.com/superteamng/solana-security-reference
-    cd solana-security-reference
+    git clone https://github.com/danielAsaboro/solana_badger
+    cd solana_badger
     ```
   </Step>
 
@@ -199,9 +217,9 @@ graph LR
   2. **Read the code** - Compare vulnerable vs secure implementations
   3. **Run the tests** - See exploits work, then fail after fixes
   4. **Experiment** - Modify code and see what breaks
-  5. **Move to CPI Vulnerabilities (🟠)** - Arbitrary CPI
-  6. **Study PDAs & Arithmetic (🟡)** - PDA Sharing
-  7. **Explore Rust & Lifecycle (🟢)** - Reinitialization
+  5. **Move to CPI Vulnerabilities (🟠)** - Arbitrary CPI, Closing Accounts
+  6. **Study PDAs & Arithmetic (🟡)** - PDA Sharing, Bump Seed Canonicalization, Integer Overflow
+  7. **Explore Rust & Lifecycle (🟢)** - Reinitialization, Unsafe Rust, Panic Handling, Dependency Security
   8. **Compare frameworks** - Understand trade-offs between Anchor and Pinocchio
 </Accordion>
 
@@ -215,6 +233,12 @@ graph LR
 | [Arbitrary CPI](/vulnerabilities/arbitrary-cpi) | 🟠 CPI Vulnerabilities | "Safe program?" | Intermediate |
 | [PDA Sharing](/vulnerabilities/pda-sharing) | 🟡 PDAs & Arithmetic | "Unique seeds?" | Intermediate |
 | [Reinitialization](/vulnerabilities/reinitialization-attacks) | 🟢 Rust & Lifecycle | "Already init?" | Intermediate |
+| [Closing Accounts](/vulnerabilities/closing-accounts) | 🟠 CPI Vulnerabilities | "Data zeroed?" | Advanced |
+| [Bump Seed Canonicalization](/vulnerabilities/bump-seed-canonicalization) | 🟡 PDAs & Arithmetic | "Canonical bump?" | Intermediate |
+| [Integer Overflow](/vulnerabilities/integer-overflow) | 🟡 PDAs & Arithmetic | "Checked math?" | Beginner |
+| [Unsafe Rust](/vulnerabilities/unsafe-rust) | 🟢 Rust & Lifecycle | "Safe memory?" | Advanced |
+| [Panic Handling](/vulnerabilities/panic-handling) | 🟢 Rust & Lifecycle | "Graceful error?" | Beginner |
+| [Dependency Security](/vulnerabilities/dependency-security) | 🟢 Rust & Lifecycle | "Trusted crate?" | N/A |
 
 ## Resources
 
@@ -222,7 +246,7 @@ graph LR
   <Card title="Documentation" icon="book" href="/vulnerabilities/signer-checks">
     Detailed vulnerability guides
   </Card>
-  <Card title="Source Code" icon="github" href="https://github.com/superteamng/solana-security-reference">
+  <Card title="Source Code" icon="github" href="https://github.com/danielAsaboro/solana_badger">
     Browse on GitHub
   </Card>
   <Card title="Run Tests" icon="terminal" href="/quickstart">
@@ -232,12 +256,6 @@ graph LR
     Framework analysis
   </Card>
 </CardGroup>
-
-## Built With
-
-<Info>
-This security reference was created for the **SuperteamNG Security Bounty** using educational content from [Blueshift.gg](https://blueshift.gg), official [Anchor](https://www.anchor-lang.com) and [Pinocchio](https://github.com/anza-xyz/pinocchio) documentation, and real-world security best practices.
-</Info>
 
 ---
 

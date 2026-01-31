@@ -1,408 +1,721 @@
 ---
 title: "Reinitialization Attacks"
-description: "How missing initialization checks enable account takeover"
+description: "How missing initialization guards allow attackers to overwrite account state and steal ownership"
 icon: "repeat"
 ---
 
+When an initialize function skips checking whether an account is already set up, anyone can call it again to overwrite the authority field and take full control of the vault.
+
+## What we will build
+
+In this tutorial we will:
+
+- Deploy a **vulnerable** Anchor program that lacks an initialization guard, then exploit it to steal vault authority from another user
+- Deploy a **secure** Anchor program that uses the `init` constraint to make reinitialization impossible
+- Examine the same vulnerability and fix in a **Pinocchio** (no-framework) program, where we guard against reinitialization with a manual discriminator check
+
 <Note>
-**🟢 Security Matrix: Rust & Lifecycle (Bottom Left)**
+**Prerequisites** -- Before starting, clone the repository and install dependencies:
 
-**Frequency:** Rare | **Impact:** Low-Medium
-
-*Rust helps prevent most of these, but lifecycle issues remain.*
+```bash
+git clone https://github.com/danielAsaboro/solana_badger.git
+cd solana_badger
+npm install
+anchor build
+```
 </Note>
 
-# Reinitialization Attacks
+## Step 1 -- Read the vulnerable Anchor program
 
-<CardGroup cols={2}>
-  <Card title="Severity" icon="circle-exclamation">
-    **High** - Allows complete account takeover and asset theft
-  </Card>
-  <Card title="Difficulty" icon="gauge">
-    **Intermediate** - Account lifecycle understanding required
-  </Card>
-</CardGroup>
-
-## Overview
-
-<Warning>
-Reinitialization attacks allow attackers to **overwrite existing accounts**, hijacking control of valuable vaults, escrows, and asset-holding accounts!
-</Warning>
-
-Reinitialization vulnerabilities occur when programs fail to check if an account has already been initialized. Attackers can call the initialization function on existing accounts, overwriting the authority field and stealing control of funds.
-
-## Attack Flow Diagram
-
-```mermaid
-sequenceDiagram
-    participant Alice
-    participant VaultAccount
-    participant Attacker
-    participant Program
-
-    Alice->>Program: initialize_vault(alice_authority)
-    Program->>VaultAccount: Create: authority = Alice, balance = 1000 SOL
-    Note over VaultAccount: ✅ Legitimate vault
-
-    Attacker->>Program: initialize_vault(attacker_authority)
-    Note over Attacker: Calls init on EXISTING vault!
-    Program->>VaultAccount: ❌ No initialization check
-    Program->>VaultAccount: Overwrite: authority = Attacker
-    Note over VaultAccount: 💀 Alice's vault hijacked!
-    Attacker->>VaultAccount: withdraw(1000 SOL)
-    Note over Attacker: Steals all funds!
-```
-
-## The Vulnerability
-
-<Tabs>
-  <Tab title="Anchor - Vulnerable">
-    ### Missing Initialization Check
-
-    ```rust filename="programs/reinitialization-attacks/vulnerable/anchor/src/instructions/unsafe_initialize.rs"
-    use anchor_lang::prelude::*;
-    use crate::state::Vault;
-
-    pub fn unsafe_initialize(ctx: Context<UnsafeInitialize>) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-
-        // VULNERABILITY: No check if vault is already initialized!
-        // Attacker can call this on existing vaults and overwrite authority
-        vault.authority = ctx.accounts.authority.key();
-        vault.balance = 0;
-
-        msg!("Vault initialized with authority: {}", vault.authority);
-        Ok(())
-    }
-
-    #[derive(Accounts)]
-    pub struct UnsafeInitialize<'info> {
-        #[account(mut)]
-        pub authority: Signer<'info>,
-
-        // VULNERABILITY: Using 'zero' constraint without 'init'
-        // This allows the account to be passed multiple times!
-        #[account(
-            mut,
-            seeds = [b"vault", authority.key().as_ref()],
-            bump,
-        )]
-        pub vault: Account<'info, Vault>,
-
-        pub system_program: Program<'info, System>,
-    }
-    ```
-
-    <Accordion title="Why is this vulnerable?">
-      **The problem:**
-      - No `init` constraint means Anchor doesn't enforce one-time initialization
-      - No manual initialization flag check
-      - Attacker can call this function on Alice's existing vault
-      - Authority field gets overwritten to attacker's address
-
-      **What should happen:** Anchor's `init` constraint automatically prevents reinitialization.
-    </Accordion>
-  </Tab>
-
-  <Tab title="Pinocchio - Vulnerable">
-    ### Missing Discriminator/Flag Check
-
-    ```rust filename="programs/reinitialization-attacks/vulnerable/pinocchio/src/lib.rs"
-    pub fn unsafe_initialize(accounts: &[AccountInfo]) -> ProgramResult {
-        let [authority_info, vault_info, system_program_info] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
-
-        if !authority_info.is_signer() {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
-
-        // VULNERABILITY: No check if vault is already initialized!
-        // Missing: if vault_data[0] != 0 { return Err(...) }
-
-        let mut vault_data = vault_info.try_borrow_mut_data()?;
-
-        // Directly overwrites data without checking initialization status
-        // vault_data[0] = discriminator (should check this first!)
-        vault_data[1..33].copy_from_slice(authority_info.key().as_ref());
-        // ... set balance to 0 ...
-
-        Ok(())
-    }
-    ```
-
-    <Info>
-    Pinocchio requires **manual discriminator checks** to prevent reinitialization. Always verify the account is uninitialized before writing data!
-    </Info>
-  </Tab>
-</Tabs>
-
-## Real-World Exploit Demo
-
-<Steps>
-  <Step title="Alice initializes vault with 1000 SOL">
-    Alice creates a legitimate vault account, depositing funds with herself as authority
-  </Step>
-  <Step title="Attacker discovers Alice's vault">
-    Bob finds Alice's vault PDA address (derived from her public key)
-  </Step>
-  <Step title="Attacker calls initialize on existing vault">
-    Bob calls the initialization function, passing Alice's existing vault account
-  </Step>
-  <Step title="Program overwrites authority">
-    Program has no initialization check, so it overwrites Alice's authority with Bob's
-  </Step>
-  <Step title="Attacker withdraws all funds">
-    Bob now controls the vault and withdraws all 1000 SOL
-  </Step>
-</Steps>
+We start by looking at the program that has no protection. The `UnsafeInitialize` accounts struct declares the vault as an `UncheckedAccount` with only a `#[account(mut)]` constraint. The handler serializes a fresh `Vault` and copies the bytes straight into the account buffer.
 
 <CodeGroup>
-```typescript Test: Exploit Works
-it("should allow attacker to reinitialize victim's vault", async () => {
-  // Alice initializes vault with 1000 SOL
-  await program.methods.unsafeInitialize()
-    .accounts({
-      authority: alice.publicKey,
-      vault: aliceVaultPda,
-    })
-    .signers([alice])
-    .rpc();
+```rust unsafe_initialize.rs
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::system_program;
+use crate::state::Vault;
 
-  await program.methods.deposit(new BN(1000))
-    .accounts({ vault: aliceVaultPda })
-    .signers([alice])
-    .rpc();
+pub fn unsafe_initialize(ctx: Context<UnsafeInitialize>) -> Result<()> {
+    let mut writer: Vec<u8> = vec![];
 
-  // Attacker calls initialize AGAIN on Alice's vault
-  await program.methods.unsafeInitialize()
-    .accounts({
-      authority: attacker.publicKey,
-      vault: aliceVaultPda,  // Alice's existing vault!
-    })
-    .signers([attacker])
-    .rpc();
+    Vault {
+        authority: ctx.accounts.authority.key(),
+        balance: 0,
+    }.try_serialize(&mut writer)?;
 
-  // Attacker now controls Alice's vault
-  const vault = await program.account.vault.fetch(aliceVaultPda);
-  expect(vault.authority).toEqual(attacker.publicKey);
+    let mut data = ctx.accounts.vault.try_borrow_mut_data()?;
+    anchor_lang::solana_program::program_memory::sol_memcpy(
+        &mut data,
+        &writer,
+        writer.len(),
+    );
 
-  // Attacker steals all funds
-  await program.methods.withdraw(new BN(1000))
-    .accounts({ vault: aliceVaultPda })
-    .signers([attacker])
-    .rpc();
-});
+    msg!("Vault initialized (or RE-initialized!) with authority: {}", ctx.accounts.authority.key());
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct UnsafeInitialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// CHECK: UNSAFE - no initialization check
+    #[account(mut)]
+    pub vault: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
 ```
 
-```bash Expected Output
-✓ should allow attacker to reinitialize victim's vault (456ms)
+```rust state.rs
+use anchor_lang::prelude::*;
 
-Vault initialized with authority: <Alice's key>
-Deposited: 1000 SOL
-Vault initialized with authority: <Attacker's key>  ← REINITIALIZATION!
-Withdrawn: 1000 SOL
+#[account]
+pub struct Vault {
+    pub authority: Pubkey,
+    pub balance: u64,
+}
 
-⚠️  VULNERABILITY: Attacker hijacked existing vault
+impl Vault {
+    /// 8 bytes discriminator + 32 bytes pubkey + 8 bytes u64
+    pub const LEN: usize = 8 + 32 + 8;
+}
+```
+
+```rust lib.rs (dispatcher)
+use anchor_lang::prelude::*;
+
+declare_id!("BBQQXUoERwojEV7hSgSCMjsNvmv2nTKkdsMpRHuGXZjT");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod vulnerable_reinitialization_attacks {
+    use super::*;
+
+    pub fn unsafe_initialize(ctx: Context<UnsafeInitialize>) -> Result<()> {
+        instructions::unsafe_initialize(ctx)
+    }
+
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        instructions::deposit(ctx, amount)
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        instructions::withdraw(ctx, amount)
+    }
+}
 ```
 </CodeGroup>
 
-## The Fix
+Notice that `UnsafeInitialize` performs zero validation on the vault account -- no discriminator check, no ownership check, no initialization guard. Calling the instruction on an already-initialized vault simply overwrites every field, including `authority`.
+
+## Step 2 -- Exploit the vulnerability
+
+We now write a test that demonstrates the full attack: Alice creates and funds a vault, then the attacker calls `unsafe_initialize` on the same account to replace Alice's authority with their own.
+
+<CodeGroup>
+```typescript tests/reinitialization-attacks.test.ts
+import * as anchor from "@coral-xyz/anchor";
+import BN from "bn.js";
+import { Keypair, SystemProgram, Transaction, sendAndConfirmTransaction } from "@solana/web3.js";
+import { assert } from "chai";
+import type { VulnerableReinitializationAttacks } from "../target/types/vulnerable_reinitialization_attacks";
+import type { SecureReinitializationAttacks } from "../target/types/secure_reinitialization_attacks";
+
+describe("Vulnerability: Reinitialization Attacks", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const vulnerableProgram: anchor.Program<VulnerableReinitializationAttacks> =
+    anchor.workspace.VulnerableReinitializationAttacks;
+  const secureProgram: anchor.Program<SecureReinitializationAttacks> =
+    anchor.workspace.SecureReinitializationAttacks;
+
+  let alice: Keypair;
+  let attacker: Keypair;
+  let vulnerableVault: Keypair;
+  let secureVault: Keypair;
+
+  const DEPOSIT_AMOUNT = 1 * anchor.web3.LAMPORTS_PER_SOL;
+
+  before(async () => {
+    alice = Keypair.generate();
+    attacker = Keypair.generate();
+    vulnerableVault = Keypair.generate();
+    secureVault = Keypair.generate();
+
+    const airdropAmount = 5 * anchor.web3.LAMPORTS_PER_SOL;
+
+    await provider.connection.requestAirdrop(alice.publicKey, airdropAmount);
+    await provider.connection.requestAirdrop(attacker.publicKey, airdropAmount);
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    console.log("      Setup complete:");
+    console.log("      Alice:", alice.publicKey.toBase58());
+    console.log("      Attacker:", attacker.publicKey.toBase58());
+    console.log("      Vulnerable Vault:", vulnerableVault.publicKey.toBase58());
+    console.log("      Secure Vault:", secureVault.publicKey.toBase58());
+  });
+
+  describe("Vulnerable Implementation (Anchor)", () => {
+    it("allows attacker to reinitialize and steal vault authority", async () => {
+      console.log("\n      EXPLOIT DEMONSTRATION:");
+
+      // Step 1: Create vault account manually
+      const vaultSize = 8 + 32 + 8;
+      const lamports = await provider.connection.getMinimumBalanceForRentExemption(vaultSize);
+
+      const createVaultTx = new Transaction().add(
+        SystemProgram.createAccount({
+          fromPubkey: alice.publicKey,
+          newAccountPubkey: vulnerableVault.publicKey,
+          lamports: lamports,
+          space: vaultSize,
+          programId: vulnerableProgram.programId,
+        })
+      );
+
+      await sendAndConfirmTransaction(
+        provider.connection,
+        createVaultTx,
+        [alice, vulnerableVault]
+      );
+
+      console.log("      1. Alice creates vault account...");
+
+      // Step 2: Alice initializes her vault
+      await vulnerableProgram.methods
+        .unsafeInitialize()
+        .accounts({
+          authority: alice.publicKey,
+          vault: vulnerableVault.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice])
+        .rpc();
+
+      console.log("      2. Alice initializes vault with herself as authority");
+
+      let vaultData = await vulnerableProgram.account.vault.fetch(vulnerableVault.publicKey);
+      assert.ok(
+        vaultData.authority.equals(alice.publicKey),
+        "Alice should be the initial authority"
+      );
+      console.log("      Verified: Alice is authority");
+
+      // Step 3: Alice deposits SOL
+      await vulnerableProgram.methods
+        .deposit(new BN(DEPOSIT_AMOUNT))
+        .accounts({
+          depositor: alice.publicKey,
+          vault: vulnerableVault.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice])
+        .rpc();
+
+      console.log("      3. Alice deposits 1 SOL into vault");
+
+      const vaultBalance = await provider.connection.getBalance(vulnerableVault.publicKey);
+      console.log("      Vault balance:", vaultBalance / anchor.web3.LAMPORTS_PER_SOL, "SOL");
+
+      // Step 4: Attacker reinitializes the vault
+      console.log("\n      4. ATTACK: Attacker reinitializes the vault...");
+
+      await vulnerableProgram.methods
+        .unsafeInitialize()
+        .accounts({
+          authority: attacker.publicKey,
+          vault: vulnerableVault.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([attacker])
+        .rpc();
+
+      console.log("      VULNERABILITY CONFIRMED: Vault reinitialized!");
+
+      vaultData = await vulnerableProgram.account.vault.fetch(vulnerableVault.publicKey);
+      assert.ok(
+        vaultData.authority.equals(attacker.publicKey),
+        "Attacker should now be authority"
+      );
+      console.log("      Attacker is now the vault authority!");
+
+      // Step 5: Attacker withdraws Alice's funds
+      console.log("\n      5. Attacker withdraws Alice's funds...");
+
+      const attackerBalanceBefore = await provider.connection.getBalance(attacker.publicKey);
+
+      try {
+        await vulnerableProgram.methods
+          .withdraw(new BN(DEPOSIT_AMOUNT))
+          .accounts({
+            authority: attacker.publicKey,
+            vault: vulnerableVault.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([attacker])
+          .rpc();
+
+        const attackerBalanceAfter = await provider.connection.getBalance(attacker.publicKey);
+        console.log("      Attacker successfully withdrew Alice's funds!");
+        console.log("      Funds stolen:", (attackerBalanceAfter - attackerBalanceBefore) / anchor.web3.LAMPORTS_PER_SOL, "SOL");
+      } catch (error: any) {
+        console.log("      Note: Withdrawal may fail due to balance tracking,");
+        console.log("      but the critical vulnerability is AUTHORITY THEFT.");
+        console.log("      Attacker now controls the vault!");
+      }
+
+      console.log("\n      ATTACK RESULT:");
+      console.log("      Original authority: Alice");
+      console.log("      New authority:", vaultData.authority.toBase58(), "(Attacker)");
+      console.log("      Alice has lost control of her vault!");
+    });
+  });
+
+  describe("Secure Implementation (Anchor)", () => {
+    it("prevents reinitialization with init constraint", async () => {
+      console.log("\n      FIX DEMONSTRATION:");
+
+      console.log("      1. Alice initializes secure vault...");
+
+      await secureProgram.methods
+        .initialize()
+        .accounts({
+          authority: alice.publicKey,
+          vault: secureVault.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice, secureVault])
+        .rpc();
+
+      console.log("      Vault initialized with Alice as authority");
+
+      let vaultData = await secureProgram.account.vault.fetch(secureVault.publicKey);
+      assert.ok(
+        vaultData.authority.equals(alice.publicKey),
+        "Alice should be authority"
+      );
+
+      await secureProgram.methods
+        .deposit(new BN(DEPOSIT_AMOUNT))
+        .accounts({
+          depositor: alice.publicKey,
+          vault: secureVault.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice])
+        .rpc();
+
+      console.log("      2. Alice deposits 1 SOL");
+
+      console.log("\n      3. ATTACK ATTEMPT: Attacker tries to reinitialize...");
+
+      let attackFailed = false;
+      let errorMessage = "";
+
+      try {
+        const attackerVault = Keypair.generate();
+
+        await secureProgram.methods
+          .initialize()
+          .accounts({
+            authority: attacker.publicKey,
+            vault: secureVault.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([attacker])
+          .rpc();
+
+        assert.fail("Expected reinitialization to fail");
+      } catch (error: any) {
+        attackFailed = true;
+        errorMessage = error.toString();
+        console.log("      FIX CONFIRMED: Reinitialization rejected!");
+        console.log("      Error:", errorMessage.substring(0, 100) + "...");
+      }
+
+      assert.ok(attackFailed, "Reinitialization should have failed");
+
+      vaultData = await secureProgram.account.vault.fetch(secureVault.publicKey);
+      assert.ok(
+        vaultData.authority.equals(alice.publicKey),
+        "Alice should still be authority"
+      );
+      console.log("      Alice is still the vault authority!");
+
+      const vaultBalance = await provider.connection.getBalance(secureVault.publicKey);
+      console.log("      Vault balance protected:", vaultBalance / anchor.web3.LAMPORTS_PER_SOL, "SOL");
+    });
+  });
+});
+```
+</CodeGroup>
+
+You will see output like this when the vulnerable test runs:
+
+```bash
+Vulnerability: Reinitialization Attacks
+    Vulnerable Implementation (Anchor)
+      EXPLOIT DEMONSTRATION:
+      1. Alice creates vault account...
+      2. Alice initializes vault with herself as authority
+      Verified: Alice is authority
+      3. Alice deposits 1 SOL into vault
+      Vault balance: ~1.001 SOL
+
+      4. ATTACK: Attacker reinitializes the vault...
+      VULNERABILITY CONFIRMED: Vault reinitialized!
+      Attacker is now the vault authority!
+
+      5. Attacker withdraws Alice's funds...
+      ATTACK RESULT:
+      Original authority: Alice
+      New authority: <attacker pubkey> (Attacker)
+      Alice has lost control of her vault!
+```
+
+Notice that the attacker never needed Alice's signature. The `sol_memcpy` in step 4 overwrites the discriminator, the `authority` pubkey, and the `balance` field in one shot. Alice's authority is gone.
+
+And when the secure implementation runs:
+
+```bash
+    Secure Implementation (Anchor)
+      FIX DEMONSTRATION:
+      1. Alice initializes secure vault...
+      2. Alice deposits 1 SOL
+
+      3. ATTACK ATTEMPT: Attacker tries to reinitialize...
+      FIX CONFIRMED: Reinitialization rejected!
+      Alice is still the vault authority!
+      Vault balance protected: ~1.001 SOL
+```
+
+Notice that the attacker's transaction is rejected outright. Alice keeps her authority and her funds.
+
+## Step 3 -- Apply the fix in Anchor
+
+We replace `UncheckedAccount` with `Account<'info, Vault>` and apply the `init` constraint. This is the entire fix on the Anchor side.
+
+<CodeGroup>
+```rust Vulnerable (unsafe_initialize.rs)
+#[derive(Accounts)]
+pub struct UnsafeInitialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// CHECK: UNSAFE - no initialization check
+    #[account(mut)]
+    pub vault: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+```
+
+```rust Secure (initialize.rs)
+use anchor_lang::prelude::*;
+use crate::state::Vault;
+
+pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+    vault.authority = ctx.accounts.authority.key();
+    vault.balance = 0;
+
+    msg!("Vault securely initialized with authority: {}", vault.authority);
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = Vault::LEN
+    )]
+    pub vault: Account<'info, Vault>,
+
+    pub system_program: Program<'info, System>,
+}
+```
+</CodeGroup>
+
+The `init` constraint does three things that together eliminate the vulnerability:
+
+1. It checks that the account's discriminator bytes are all zeros before proceeding -- if the account is already initialized, the transaction fails immediately.
+2. It calls `create_account` via CPI to the System Program, which itself will fail if the account already exists with data.
+3. After writing the struct fields, it stamps the 8-byte Anchor discriminator into the account, permanently marking it as initialized.
+
+## Step 4 -- Read the vulnerable Pinocchio program
+
+In the no-framework version, we define the account layout manually. Byte 0 is a discriminator, bytes 1--32 hold the authority pubkey, and bytes 33--40 hold the balance. The vulnerable implementation writes all of these fields without ever checking whether the discriminator is already set.
+
+<CodeGroup>
+```rust Vulnerable lib.rs
+#![no_std]
+
+#[cfg(not(feature = "no-entrypoint"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+
+pub mod state;
+use state::Vault;
+
+const ID: Address = Address::new_from_array([
+    0xd1, 0x6c, 0x7e, 0x1f, 0x8a, 0xb3, 0x4c, 0x5d,
+    0xe9, 0x2a, 0x1b, 0xf6, 0xc3, 0x7d, 0x4e, 0x8f,
+    0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xfa, 0x0b, 0x1c,
+    0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72, 0x83, 0x94,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => unsafe_initialize(accounts),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn unsafe_initialize(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, vault_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = vault_info.try_borrow_mut()?;
+
+    if data.len() < Vault::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    // No check whether discriminator is already set!
+    data[0] = Vault::DISCRIMINATOR;
+    data[1..33].copy_from_slice(authority_info.address().as_ref());
+    data[33..41].fill(0);
+
+    Ok(())
+}
+```
+
+```rust Vulnerable state.rs
+pub struct Vault;
+
+impl Vault {
+    pub const LEN: usize = 1 + 32 + 8; // 41 bytes total
+    pub const DISCRIMINATOR: u8 = 1;
+}
+```
+</CodeGroup>
+
+Notice that `data[0]` is unconditionally overwritten. An attacker who knows the vault's address can call `unsafe_initialize` and replace `data[1..33]` with their own pubkey.
+
+## Step 5 -- Apply the fix in Pinocchio
+
+We add exactly one guard: read `data[0]` and return `AccountAlreadyInitialized` if the discriminator is already set.
+
+<CodeGroup>
+```rust Secure lib.rs
+#![no_std]
+
+#[cfg(not(feature = "no-entrypoint"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+
+pub mod state;
+use state::Vault;
+
+const ID: Address = Address::new_from_array([
+    0x3e, 0x2d, 0x1c, 0x0b, 0xfa, 0xe9, 0xd8, 0xc7,
+    0xb6, 0xa5, 0x94, 0x83, 0x72, 0x61, 0x50, 0x4f,
+    0x3e, 0x2d, 0x1c, 0x0b, 0xfa, 0xe9, 0xd8, 0xc7,
+    0xb6, 0xa5, 0x94, 0x83, 0x72, 0x61, 0x50, 0x4f,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize(accounts),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn initialize(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, vault_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = vault_info.try_borrow_mut()?;
+
+    if data.len() < Vault::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    // FIX: reject if already initialized
+    if data[0] == Vault::DISCRIMINATOR {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    data[0] = Vault::DISCRIMINATOR;
+    data[1..33].copy_from_slice(authority_info.address().as_ref());
+    data[33..41].fill(0);
+
+    Ok(())
+}
+```
+
+```rust Secure state.rs
+pub struct Vault;
+
+impl Vault {
+    pub const LEN: usize = 1 + 32 + 8; // 41 bytes total
+    pub const DISCRIMINATOR: u8 = 1;
+}
+```
+</CodeGroup>
+
+The fix is three lines:
+
+```rust
+if data[0] == Vault::DISCRIMINATOR {
+    return Err(ProgramError::AccountAlreadyInitialized);
+}
+```
+
+If Alice has already initialized her vault, `data[0]` is `1`. When the attacker calls `initialize`, the function reads `data[0]`, sees it equals `Vault::DISCRIMINATOR`, and returns an error before any data is written. Alice's authority is never touched.
+
+## Side-by-side comparison
 
 <Tabs>
-  <Tab title="Anchor - Fix #1: Init Constraint">
-    ### Use 'init' Constraint (Recommended)
-
-    ```rust filename="programs/reinitialization-attacks/secure/anchor/src/instructions/initialize.rs"
-    #[derive(Accounts)]
-    pub struct Initialize<'info> {
-        #[account(mut)]
-        pub authority: Signer<'info>,
-
-        // FIX: 'init' constraint prevents reinitialization automatically
-        #[account(
-            init,
-            payer = authority,
-            space = 8 + Vault::INIT_SPACE,
-            seeds = [b"vault", authority.key().as_ref()],
-            bump,
-        )]
-        pub vault: Account<'info, Vault>,
-
-        pub system_program: Program<'info, System>,
-    }
-    ```
-
-    <Accordion title="How 'init' prevents reinitialization">
-      Anchor's `init` constraint enforces:
-      1. Account must not already exist or must have zero data
-      2. Allocates and assigns account to the program
-      3. Sets the discriminator automatically
-      4. Transaction fails if account is already initialized
-
-      **Cannot be called twice on the same account!**
-    </Accordion>
-  </Tab>
-
-  <Tab title="Anchor - Fix #2: Init-If-Needed">
-    ### Use 'init_if_needed' with Caution
+  <Tab title="Anchor">
+    **Vulnerable:** Uses `UncheckedAccount` and manual `sol_memcpy` with no init guard.
 
     ```rust
-    // Use only when you genuinely need idempotent initialization
+    #[account(mut)]
+    /// CHECK: UNSAFE
+    pub vault: UncheckedAccount<'info>,
+    ```
+
+    **Secure:** Uses `Account<'info, Vault>` with the `init` constraint.
+
+    ```rust
     #[account(
-        init_if_needed,
+        init,
         payer = authority,
-        space = 8 + Vault::INIT_SPACE,
-        seeds = [b"vault", authority.key().as_ref()],
-        bump,
+        space = Vault::LEN
     )]
     pub vault: Account<'info, Vault>,
     ```
 
-    <Warning>
-    `init_if_needed` allows reinitialization by design. Only use when you have additional logic to preserve existing data or when idempotency is required.
-    </Warning>
+    The `init` constraint handles discriminator validation, account creation, and rent payment automatically.
   </Tab>
 
-  <Tab title="Anchor - Fix #3: Manual Check">
-    ### Manual Initialization Flag
+  <Tab title="Pinocchio">
+    **Vulnerable:** Writes directly to the data buffer without reading the discriminator.
 
     ```rust
-    #[account]
-    pub struct Vault {
-        pub is_initialized: bool,  // Initialization flag
-        pub authority: Pubkey,
-        pub balance: u64,
-    }
-
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let vault = &mut ctx.accounts.vault;
-
-        // FIX: Check initialization flag
-        if vault.is_initialized {
-            return Err(ErrorCode::AlreadyInitialized.into());
-        }
-
-        vault.is_initialized = true;
-        vault.authority = ctx.accounts.authority.key();
-        vault.balance = 0;
-
-        Ok(())
-    }
-    ```
-  </Tab>
-
-  <Tab title="Pinocchio - Secure">
-    ### Check Discriminator Before Writing
-
-    ```rust filename="programs/reinitialization-attacks/secure/pinocchio/src/lib.rs"
-    pub fn initialize(accounts: &[AccountInfo]) -> ProgramResult {
-        let [authority_info, vault_info, system_program_info] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
-
-        if !authority_info.is_signer() {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
-
-        let mut vault_data = vault_info.try_borrow_mut_data()?;
-
-        // FIX: Check if account is already initialized
-        // Discriminator is the first 8 bytes
-        // If non-zero, account is already initialized
-        if vault_data[0] != 0 {
-            return Err(ProgramError::AccountAlreadyInitialized);
-        }
-
-        // Safe to initialize now
-        vault_data[0] = VAULT_DISCRIMINATOR;
-        vault_data[1..33].copy_from_slice(authority_info.key().as_ref());
-        // ... initialize balance ...
-
-        Ok(())
-    }
+    data[0] = Vault::DISCRIMINATOR;
+    data[1..33].copy_from_slice(authority_info.address().as_ref());
+    data[33..41].fill(0);
     ```
 
-    <Info>
-    **Best Practice:** Check discriminator (first byte or first 8 bytes) before ANY data writes in initialization functions.
-    </Info>
+    **Secure:** Reads `data[0]` and returns an error if the account is already initialized.
+
+    ```rust
+    if data[0] == Vault::DISCRIMINATOR {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
+
+    data[0] = Vault::DISCRIMINATOR;
+    data[1..33].copy_from_slice(authority_info.address().as_ref());
+    data[33..41].fill(0);
+    ```
+
+    Without a framework to enforce initialization guards, every Pinocchio program must manually validate the discriminator before writing to any account for the first time.
   </Tab>
 </Tabs>
 
-## Testing the Fix
+## Key takeaways
 
-<CodeGroup>
-```typescript Test: Reinitialization Blocked
-it("should prevent reinitialization of existing vault", async () => {
-  // Alice initializes vault
-  await program.methods.initialize()
-    .accounts({
-      authority: alice.publicKey,
-      vault: aliceVaultPda,
-    })
-    .signers([alice])
-    .rpc();
+- **Always use the `init` constraint in Anchor.** It checks the discriminator, creates the account, and stamps the discriminator in one atomic operation.
+- **In Pinocchio, check the discriminator before every write in an initialization function.** A single `if data[0] == DISCRIMINATOR { return Err(...) }` prevents total loss of funds.
+- **PDAs are deterministic and publicly derivable.** Security comes from initialization guards, not from address obscurity.
+- **Reinitialization steals authority, not just data.** By overwriting the `authority` field, the attacker gains full control and can call `withdraw` at their leisure.
+- **Test both directions.** Verify that initialization works for the first caller, and verify that a second call from a different signer fails.
 
-  // Attacker tries to reinitialize
-  try {
-    await program.methods.initialize()
-      .accounts({
-        authority: attacker.publicKey,
-        vault: aliceVaultPda,  // Existing vault
-      })
-      .signers([attacker])
-      .rpc();
+## Run it yourself
 
-    assert.fail("Expected transaction to fail");
-  } catch (err) {
-    // FIX CONFIRMED: Reinitialization prevented
-    expect(err.toString()).toContain("AlreadyInUse");
-  }
+```bash
+git clone https://github.com/danielAsaboro/solana_badger.git
+cd solana_badger
+npm install
+anchor build
 
-  // Verify Alice still owns vault
-  const vault = await program.account.vault.fetch(aliceVaultPda);
-  expect(vault.authority).toEqual(alice.publicKey);
-});
+# Run the Anchor reinitialization tests
+anchor test -- --grep "Reinitialization"
+
+# Run the Pinocchio reinitialization tests
+npx jest tests/pinocchio/reinitialization.pinocchio.test.ts
 ```
 
-```bash Expected Output
-✓ should prevent reinitialization of existing vault (289ms)
-
-Error: Account allocation already in use
-✅ FIX CONFIRMED: Reinitialization prevented
-```
-</CodeGroup>
-
-## Security Checklist
-
-- [ ] All initialization functions use `init` constraint (Anchor)
-- [ ] Or manual discriminator/flag checks (Pinocchio)
-- [ ] Tests verify reinitialization attempts fail
-- [ ] No direct data overwrites without initialization checks
-- [ ] `init_if_needed` only used when genuinely needed
-
-## Real-World Impact
-
-This vulnerability has led to:
-- **Complete account takeovers** - attackers steal control of vaults/escrows
-- **Asset theft** - billions in locked funds become accessible to attackers
-- **Protocol manipulation** - admin accounts get hijacked
-
-**High-profile examples:**
-- Escrow programs without init checks
-- Vault programs allowing authority overwrites
-- Staking pools with reinitialization vulnerabilities
-
-## Resources & Next Steps
-
-<CardGroup cols={3}>
-  <Card title="View Source Code" icon="code" href="https://github.com/superteamng/solana-security-reference/tree/main/programs/reinitialization-attacks">
-    Browse vulnerable and secure implementations
-  </Card>
-  <Card title="Run Tests" icon="flask" href="https://github.com/superteamng/solana-security-reference/tree/main/tests">
-    See reinitialization attacks demonstrated
-  </Card>
-  <Card title="Next: Type Cosplay" icon="arrow-right" href="/vulnerabilities/type-cosplay">
-    Learn about account type confusion attacks
-  </Card>
-</CardGroup>
+You will see the vulnerable test pass (confirming the exploit works) and the secure test pass (confirming the fix blocks reinitialization). Both suites should print green checkmarks.

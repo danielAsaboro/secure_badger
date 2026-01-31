@@ -1,311 +1,268 @@
 ---
 title: "Security Trade-offs"
-description: "Understanding the balance between security, performance, and development speed"
+description: "Understanding the balance between security, performance, and development speed in Solana programs"
 icon: "scale-balanced"
 ---
 
-# Security Trade-offs in Solana Development
+# Security Trade-offs
 
-## Overview
+Building Solana programs means choosing between automatic safety and manual control. Anchor wraps every account in validation logic before your instruction even runs; Pinocchio hands you raw bytes and trusts you to check them yourself. This page examines what you actually gain and lose with each approach, grounded in code from this repository.
 
-Building secure Solana programs requires balancing multiple competing priorities: **security**, **performance**, **development speed**, and **maintainability**. This guide explores the fundamental trade-offs and helps you make informed decisions for your project.
+## What Anchor gives you for free
 
-<CardGroup cols={3}>
-  <Card title="Security" icon="shield-halved">
-    **Highest Priority**
-    Protection against exploits and attacks
-  </Card>
-  <Card title="Performance" icon="gauge-high">
-    **Medium Priority**
-    Transaction speed and compute efficiency
-  </Card>
-  <Card title="Dev Speed" icon="rocket">
-    **Variable Priority**
-    Time to market and iteration velocity
-  </Card>
-</CardGroup>
+Anchor's account types encode security constraints directly in the struct definition. The framework validates every constraint before your instruction body executes. Here is what that looks like in practice, taken from the [secure owner-checks implementation](https://github.com/danielAsaboro/solana_badger/tree/main/programs/owner-checks/secure/anchor/src/instructions/update_data.rs):
 
-## The Core Trade-off Triangle
+```rust
+#[derive(Accounts)]
+pub struct UpdateData<'info> {
+    /// Signer check: Anchor verifies this account signed the transaction.
+    pub authority: Signer<'info>,
 
-```mermaid
-graph TD
-    A[Security] ---|Type Safety<br/>Automatic Checks| B[Development Speed]
-    B ---|Abstractions<br/>Higher-Level APIs| C[Performance]
-    C ---|Manual Control<br/>Zero-Copy| A
-
-    style A fill:#f96,stroke:#333,stroke-width:4px
-    style B fill:#6f9,stroke:#333,stroke-width:2px
-    style C fill:#69f,stroke:#333,stroke-width:2px
+    /// Owner check + discriminator check + deserialization:
+    /// Account<'info, ProgramAccount> guarantees the account is owned by
+    /// this program, has the correct 8-byte discriminator, and deserializes
+    /// to ProgramAccount. All before your instruction runs.
+    #[account(mut)]
+    pub program_account: Account<'info, ProgramAccount>,
+}
 ```
 
-**The Reality:** You can optimize for 2 of the 3, but rarely all at once.
+With these two lines of struct definition, Anchor automatically performs:
 
-<Tabs>
-  <Tab title="Security + Dev Speed">
-    ### Anchor Framework Approach
+| Check | How Anchor enforces it | What happens if it fails |
+|-------|----------------------|--------------------------|
+| **Signer** | `Signer<'info>` type | `MissingRequiredSignature` error |
+| **Owner** | `Account<'info, T>` verifies `account.owner == crate::ID` | `ConstraintOwner` error |
+| **Discriminator** | `Account<'info, T>` checks the first 8 bytes | `AccountDiscriminatorMismatch` error |
+| **Deserialization** | `Account<'info, T>` deserializes or rejects | `AccountDidNotDeserialize` error |
+| **Program ID** | `Program<'info, T>` type | `InvalidProgramId` error |
+| **Initialization** | `init` constraint (shown below) | `AccountAlreadyInitialized` error |
 
-    **Choose this when:**
-    - Building DeFi protocols handling significant value
-    - Team is learning Solana development
-    - Time to market matters (faster development)
-    - Security is non-negotiable
+For initialization protection, the [secure reinitialization implementation](https://github.com/danielAsaboro/solana_badger/tree/main/programs/reinitialization-attacks/secure/anchor/src/instructions/initialize.rs) shows how a single constraint handles account creation, rent, sizing, and reinitialization prevention:
 
-    **What you get:**
-    - ✅ Type-safe account validation
-    - ✅ Automatic security checks (owner, signer, discriminator)
-    - ✅ Faster development (less boilerplate)
-    - ✅ Compile-time error detection
-    - ❌ Slightly larger program size (~250 KB)
-    - ❌ Small runtime overhead (~5-10% slower)
-
-    **Example:** Staking protocol, DEX, lending platform
-  </Tab>
-
-  <Tab title="Performance + Security">
-    ### Pinocchio with Manual Checks
-
-    **Choose this when:**
-    - Performance is critical (high-frequency operations)
-    - Team has deep Solana expertise
-    - Program size must be minimal
-    - Can afford extensive security audits
-
-    **What you get:**
-    - ✅ Maximum performance (zero-copy, minimal overhead)
-    - ✅ Smallest possible program size (~80 KB)
-    - ✅ Complete control over validation
-    - ✅ Can optimize hot paths
-    - ❌ Slower development (more code to write)
-    - ❌ Higher bug risk (manual validation)
-    - ❌ Requires disciplined security practices
-
-    **Example:** High-frequency trading engine, orderbook
-  </Tab>
-
-  <Tab title="Dev Speed + Performance">
-    ### ⚠️ Dangerous Territory
-
-    **Reality check:** Sacrificing security is almost never justified.
-
-    **The temptation:**
-    - Skip validation checks for "performance"
-    - Use `UncheckedAccount` everywhere for "simplicity"
-    - Assume "we'll add security later"
-
-    **What actually happens:**
-    - 🔥 Production exploits
-    - 💸 Loss of funds
-    - 📉 Protocol reputation destroyed
-    - ⚖️ Potential legal liability
-
-    **The correct approach:**
-    - Never compromise on security
-    - Use Anchor if unsure (security by default)
-    - Optimize performance AFTER securing
-    - Profile before optimizing
-  </Tab>
-</Tabs>
-
-## Framework Security Comparison
-
-### Automatic vs Manual Validation
-
-<CodeGroup>
-```rust Anchor: Security by Default
-// Anchor automatically validates:
-// ✅ Account ownership (program owns account)
-// ✅ Signer validation (account signed transaction)
-// ✅ Discriminator (correct account type)
-// ✅ Account data deserialization
-
+```rust
 #[derive(Accounts)]
-pub struct SecureOperation<'info> {
+pub struct Initialize<'info> {
     #[account(mut)]
-    pub user: Signer<'info>,  // Auto signer check
+    pub authority: Signer<'info>,
 
     #[account(
-        mut,
-        has_one = user,  // Auto data validation
+        init,           // Checks discriminator is zero, creates account,
+        payer = authority, // sets discriminator after init -- one keyword
+        space = Vault::LEN // handles rent and sizing automatically
     )]
-    pub vault: Account<'info, Vault>,  // Auto owner + discriminator
+    pub vault: Account<'info, Vault>,
 
-    pub token_program: Program<'info, Token>,  // Auto program ID check
+    pub system_program: Program<'info, System>,
 }
-
-// If ANY validation fails → transaction rejected
-// Developer cannot forget these checks
 ```
 
-```rust Pinocchio: Manual Everything
-// Pinocchio validates nothing automatically
-// Developer must remember EVERY check
+The instruction body is pure business logic:
 
-pub fn secure_operation(accounts: &[AccountInfo]) -> ProgramResult {
-    let [user_info, vault_info, token_program_info] = accounts else {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    };
-
-    // ✅ Must manually check signer
-    if !user_info.is_signer() {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-
-    // ✅ Must manually check owner
-    if !vault_info.is_owned_by(&crate::ID) {
-        return Err(ProgramError::InvalidAccountOwner);
-    }
-
-    // ✅ Must manually check discriminator
-    let data = vault_info.try_borrow_data()?;
-    if data[0..8] != VAULT_DISCRIMINATOR {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    // ✅ Must manually validate program ID
-    if token_program_info.key() != &spl_token::ID {
-        return Err(ProgramError::IncorrectProgramId);
-    }
-
-    // Easy to forget ANY of these → vulnerability!
+```rust
+pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+    vault.authority = ctx.accounts.authority.key();
+    vault.balance = 0;
     Ok(())
 }
 ```
-</CodeGroup>
 
-<Warning>
-**Critical Insight:** Anchor's "overhead" is actually **mandatory security checks**. Skipping them in Pinocchio doesn't improve performance - it creates vulnerabilities!
-</Warning>
+No validation code. No error branches. Anchor handled all of it.
 
-## Performance Analysis
+## What Pinocchio requires you to do manually
 
-### Real-World Benchmarks
-
-| Operation | Anchor | Pinocchio | Difference |
-|-----------|--------|-----------|------------|
-| Account Validation | ~2,500 CU | ~1,800 CU | 28% faster |
-| Token Transfer CPI | ~4,200 CU | ~3,900 CU | 7% faster |
-| PDA Derivation | ~1,200 CU | ~1,200 CU | Same |
-| Account Deserialization | ~800 CU | ~600 CU | 25% faster |
-| **Total Simple Transaction** | ~8,700 CU | ~7,500 CU | **14% faster** |
-
-**Program Size:**
-- Anchor: ~200-300 KB (with dependencies)
-- Pinocchio: ~60-100 KB (minimal dependencies)
-
-<AccordionGroup>
-  <Accordion title="When Performance Matters">
-    **Scenarios where 14% matters:**
-    - High-frequency trading (microseconds count)
-    - Composability with many CPIs (compute budget limited)
-    - Programs approaching 200K CU limit
-    - Large-scale orderbook operations
-
-    **When to use Pinocchio:**
-    - Team has 3+ experienced Solana developers
-    - Comprehensive test suite with exploit demos
-    - Security audit budget available
-    - Performance benchmarks show critical need
-  </Accordion>
-
-  <Accordion title="When Performance Doesn't Matter">
-    **Most programs have plenty of compute budget:**
-    - Staking: ~20K CU used of 200K available
-    - Token swaps: ~40K CU used
-    - NFT minting: ~15K CU used
-    - Escrow operations: ~30K CU used
-
-    **14% of 30K CU = 4,200 CU saved** - not meaningful when you have 170K unused.
-
-    **When to use Anchor:**
-    - Any program not hitting compute limits
-    - Teams learning Solana
-    - Security is primary concern
-    - Faster time to market needed
-  </Accordion>
-
-  <Accordion title="The Hidden Cost of Manual Validation">
-    **Pinocchio's "performance advantage" disappears when:**
-    - Bug fixes require emergency patches
-    - Security audits find missing checks
-    - Exploits drain protocol funds
-    - Development slows due to complex validation logic
-
-    **Real cost example:**
-    - Anchor development: 4 weeks
-    - Pinocchio development: 6 weeks (50% more code)
-    - Pinocchio audit: 2 extra weeks (more complex validation)
-    - **Total: 2x longer development cycle** for 14% performance gain
-  </Accordion>
-</AccordionGroup>
-
-## Security Maturity Levels
-
-### Level 1: Vulnerable (What NOT to do)
-
-<Warning>
-These approaches are **unacceptable** for production code.
-</Warning>
+Here is the equivalent `update_data` function from the [secure Pinocchio owner-checks implementation](https://github.com/danielAsaboro/solana_badger/tree/main/programs/owner-checks/secure/pinocchio/src/lib.rs). Every check that Anchor performs automatically must be written by hand:
 
 ```rust
-// ❌ Using UncheckedAccount without validation
-pub admin: UncheckedAccount<'info>,
+fn update_data(accounts: &[AccountView], instruction_data: &[u8]) -> ProgramResult {
+    // 1. Account count check (Anchor does this via struct destructuring)
+    let [authority_info, program_account_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-// ❌ Skipping signer checks "for simplicity"
-// No is_signer() check
+    // 2. Signer check (Anchor: Signer<'info> type)
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
-// ❌ Assuming data is valid without owner check
-let data = account.try_borrow_data()?;
-let user = User::load(&data)?;  // No owner check!
+    // 3. Owner check (Anchor: Account<'info, T> type)
+    if !program_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
 
-// ❌ Trusting any program for CPI
-invoke(&instruction, accounts)?;  // No program ID check!
+    // 4. Instruction data validation (Anchor: function signature types)
+    if instruction_data.len() < 9 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let new_data = u64::from_le_bytes(instruction_data[1..9].try_into().unwrap());
+
+    // 5. Borrow and size check (Anchor: automatic deserialization)
+    let account_data = program_account_info.try_borrow()?;
+    if account_data.len() < ProgramAccount::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    // 6. Initialization check (Anchor: discriminator check)
+    if account_data[0] != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // 7. Manual deserialization (Anchor: automatic)
+    let stored_data = u64::from_le_bytes(account_data[1..9].try_into().unwrap());
+    let stored_authority = Address::new_from_array(
+        <[u8; 32]>::try_from(&account_data[9..41]).unwrap()
+    );
+
+    // --- Business logic starts here ---
+    // (update account data)
+
+    Ok(())
+}
 ```
 
-**Result:** Guaranteed exploits in production. Do not ship.
+That is seven distinct validation steps before a single line of business logic runs. In the Anchor version, all seven are handled by the two-field struct definition.
 
-### Level 2: Basic Security (Minimum viable)
+The entrypoint itself also requires manual program ID validation and instruction dispatch:
 
 ```rust
-// ✅ Anchor with basic types
-#[account(mut)]
-pub user: Signer<'info>,
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    // Program ID check (Anchor: automatic via declare_id!)
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
 
-#[account(mut)]
+    // Instruction dispatch (Anchor: automatic via #[program] macro)
+    match instruction_data.first() {
+        Some(&0) => initialize(accounts, instruction_data),
+        Some(&1) => update_data(accounts, instruction_data),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+```
+
+## The real cost of "performance"
+
+Let us count the lines in the secure Pinocchio `update_data` function above. The function spans roughly 50 lines. Of those:
+
+| Category | Lines | Percentage |
+|----------|-------|------------|
+| Validation and error handling | ~30 | 60% |
+| Data parsing and deserialization | ~10 | 20% |
+| Business logic | ~5 | 10% |
+| Comments and whitespace | ~5 | 10% |
+
+The Anchor equivalent puts all validation in the struct (5 lines) and business logic in the function (8 lines). The total is 13 lines for the same security guarantees.
+
+Pinocchio's compute unit savings do not come from eliminating validation -- they come from giving you the option to skip it. When you write all the same checks by hand (as you must for a secure program), the performance gap narrows substantially. What remains is the overhead of Anchor's deserialization and IDL generation, not the cost of security itself.
+
+<Warning>
+If your Pinocchio program uses fewer compute units than the equivalent Anchor program **and** you wrote fewer validation checks, you did not gain performance -- you lost security.
+</Warning>
+
+## Security maturity levels
+
+### Level 1: Vulnerable
+
+These patterns appear in the vulnerable implementations throughout this repository. They represent code that will be exploited in production.
+
+From the [vulnerable signer-checks Anchor implementation](https://github.com/danielAsaboro/solana_badger/tree/main/programs/signer-checks/vulnerable/anchor/src/instructions/update_owner.rs):
+
+```rust
+#[derive(Accounts)]
+pub struct UpdateOwnership<'info> {
+    // UncheckedAccount instead of Signer -- anyone can pass any pubkey
+    /// CHECK: INTENTIONALLY VULNERABLE
+    pub owner: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        has_one = owner,  // Checks data matches, NOT that owner signed
+        seeds = [b"program-account", owner.key().as_ref()],
+        bump
+    )]
+    pub program_account: Account<'info, ProgramAccount>,
+
+    /// CHECK: This is the new owner being set
+    pub new_owner: UncheckedAccount<'info>,
+}
+```
+
+The `has_one` constraint verifies that `program_account.owner == owner.key()`, but it does **not** verify that `owner` signed the transaction. An attacker reads the owner's pubkey from on-chain data, passes it as the `owner` account without a signature, and transfers ownership to themselves.
+
+From the [vulnerable signer-checks Pinocchio implementation](https://github.com/danielAsaboro/solana_badger/tree/main/programs/signer-checks/vulnerable/pinocchio/src/lib.rs), the same mistake in raw form:
+
+```rust
+// Data validation passes (stored key == provided key)
+if stored_owner != *owner_info.address() {
+    return Err(ProgramError::InvalidAccountData);
+}
+
+// MISSING: if !owner_info.is_signer() { return Err(...); }
+
+// Attacker changes ownership without the real owner's signature
+data[1..33].copy_from_slice(new_owner_info.address().as_ref());
+```
+
+### Level 2: Basic security
+
+The minimum fix addresses the specific vulnerability. From the [secure signer-checks Anchor implementation](https://github.com/danielAsaboro/solana_badger/tree/main/programs/signer-checks/secure/anchor/src/instructions/update_owner.rs):
+
+```rust
+#[derive(Accounts)]
+pub struct UpdateOwnership<'info> {
+    pub owner: Signer<'info>,  // One type change fixes the vulnerability
+
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [b"program-account", owner.key().as_ref()],
+        bump
+    )]
+    pub program_account: Account<'info, ProgramAccount>,
+
+    /// CHECK: This is the new owner being set
+    pub new_owner: UncheckedAccount<'info>,
+}
+```
+
+Changing `UncheckedAccount` to `Signer` is a single-word fix in Anchor. In Pinocchio, the equivalent fix is adding `if !owner_info.is_signer() { return Err(ProgramError::MissingRequiredSignature); }` -- easy to write, but also easy to forget.
+
+### Level 3: Production ready
+
+Anchor's constraint system lets you layer business logic validation on top of the automatic checks. From the [secure reinitialization implementation](https://github.com/danielAsaboro/solana_badger/tree/main/programs/reinitialization-attacks/secure/anchor/src/instructions/initialize.rs):
+
+```rust
+#[account(
+    init,                    // Prevents reinitialization
+    payer = authority,       // Handles rent
+    space = Vault::LEN       // Correct sizing
+)]
 pub vault: Account<'info, Vault>,
-
-// ✅ Pinocchio with all required checks
-if !user.is_signer() { return Err(...); }
-if !vault.is_owned_by(&ID) { return Err(...); }
-if data[0..8] != DISCRIMINATOR { return Err(...); }
 ```
 
-**Result:** Protects against common attacks. Acceptable for low-value protocols.
-
-### Level 3: Production Ready (Recommended)
+In production, you combine multiple constraints:
 
 ```rust
-// ✅ Anchor with constraints
 #[account(
     mut,
     has_one = authority,
     constraint = vault.amount >= min_amount @ ErrorCode::InsufficientFunds,
 )]
 pub vault: Account<'info, Vault>,
-
-// ✅ Pinocchio with comprehensive validation
-if !user.is_signer() { return Err(...); }
-if !vault.is_owned_by(&ID) { return Err(...); }
-if data[0..8] != DISCRIMINATOR { return Err(...); }
-if vault.amount < min_amount { return Err(...); }
-// + Additional business logic validation
 ```
 
-**Result:** Secure against known attacks. Ready for moderate-value protocols.
+Each `constraint` is a compile-time guarantee that the check will run before the instruction body.
 
-### Level 4: Battle-Tested (High-value DeFi)
+### Level 4: Battle-tested
+
+For high-value protocols, add runtime checks inside the instruction body on top of the declarative constraints:
 
 ```rust
-// ✅ Anchor with custom constraints + runtime checks
 #[account(
     mut,
     has_one = authority,
@@ -315,141 +272,20 @@ if vault.amount < min_amount { return Err(...); }
 )]
 pub vault: Account<'info, Vault>,
 
-// + Additional runtime checks in instruction
+// Additional runtime checks in instruction body
 pub fn secure_operation(ctx: Context<Operation>, amount: u64) -> Result<()> {
     require!(
         ctx.accounts.vault.last_operation + MIN_DELAY < Clock::get()?.unix_timestamp,
         ErrorCode::RateLimited
     );
-
-    // Multiple security layers
+    // Multiple defense layers
     Ok(())
 }
 ```
 
-**Result:** Maximum security. Suitable for high-value protocols. Requires security audit.
+This combines declarative constraints (checked before the instruction runs) with imperative checks (checked inside the instruction), giving auditors two independent layers to verify.
 
-## Decision Framework
-
-### When to Choose Anchor
-
-<CardGroup cols={2}>
-  <Card title="✅ Use Anchor When" icon="check">
-    - Building DeFi protocols
-    - Team learning Solana
-    - Security is critical
-    - Fast development needed
-    - Handling significant value
-    - Composability important
-    - Want automatic safety
-  </Card>
-
-  <Card title="✅ Anchor Advantages" icon="shield-halved">
-    - Type safety prevents bugs
-    - Auto validation (owner, signer, discriminator)
-    - Faster development (50% less code)
-    - Better IDE support
-    - Easier to audit
-    - Community best practices
-    - Extensive documentation
-  </Card>
-</CardGroup>
-
-### When to Choose Pinocchio
-
-<CardGroup cols={2}>
-  <Card title="✅ Use Pinocchio When" icon="check">
-    - Performance critical (HFT, orderbooks)
-    - Team has deep Solana expertise
-    - Program size must be minimal
-    - Can afford extensive audits
-    - Compute budget is tight
-    - Zero-copy required
-  </Card>
-
-  <Card title="⚠️ Pinocchio Requirements" icon="triangle-exclamation">
-    - 3+ experienced Solana devs
-    - Comprehensive test coverage
-    - Security audit budget
-    - Disciplined code review
-    - Explicit validation checklist
-    - Performance benchmarks proving need
-  </Card>
-</CardGroup>
-
-## Common Misconceptions
-
-<AccordionGroup>
-  <Accordion title="Myth: Anchor is 'slow'">
-    **Reality:** Anchor's overhead is 5-15% in most operations, primarily from **mandatory security checks** that you should be doing anyway in Pinocchio.
-
-    Skipping these checks in Pinocchio doesn't make your program faster - it makes it **vulnerable**.
-
-    **Benchmarks show:**
-    - Most programs use <30% of compute budget
-    - Anchor's "overhead" = proper security validation
-    - Real bottlenecks: CPI calls, account fetches, not validation
-  </Accordion>
-
-  <Accordion title="Myth: Pinocchio is 'expert mode'">
-    **Reality:** Pinocchio isn't inherently more powerful - it's **more dangerous** without proper discipline.
-
-    Every security check Anchor does automatically, Pinocchio developers must remember manually. It's not "expert mode" - it's **manual mode** with no safety net.
-
-    **The trap:**
-    - Feeling "powerful" with UncheckedAccount
-    - Forgetting a single validation check
-    - Shipping with critical vulnerabilities
-  </Accordion>
-
-  <Accordion title="Myth: We can add security later">
-    **Reality:** Security added after initial development is **always incomplete**.
-
-    **Why "later" fails:**
-    - Refactoring entire validation layer is expensive
-    - Edge cases missed during bolted-on fixes
-    - Team momentum resists comprehensive changes
-    - Auditors find more issues in retrofitted security
-
-    **The truth:** Build secure from day one or rebuild from scratch.
-  </Accordion>
-
-  <Accordion title="Myth: Manual validation gives better security">
-    **Reality:** Manual validation is **error-prone** and harder to audit.
-
-    **Research shows:**
-    - 70% of Solana exploits stem from missing validation
-    - Anchor's automatic checks prevent most common vulnerabilities
-    - Manual checks are easy to forget (see: every missing signer check exploit)
-
-    **Better security = Less code to audit, fewer places for mistakes**
-  </Accordion>
-</AccordionGroup>
-
-## Migration Strategies
-
-### Starting with Anchor, Optimizing to Pinocchio
-
-<Steps>
-  <Step title="Build in Anchor first">
-    Develop entire protocol with Anchor's safety guarantees. Get to production faster with confidence.
-  </Step>
-  <Step title="Profile in production">
-    Measure actual performance with real usage patterns. Identify true bottlenecks (usually not validation!).
-  </Step>
-  <Step title="Optimize hot paths only">
-    Convert ONLY the 5-10% of code that's performance-critical to Pinocchio. Keep security-critical paths in Anchor.
-  </Step>
-  <Step title="Maintain test parity">
-    Every Pinocchio optimization must have equivalent security tests proving all checks are preserved.
-  </Step>
-</Steps>
-
-<Info>
-**Success Story:** Many production protocols use **hybrid approaches** - Anchor for most logic, Pinocchio for specific hot paths like orderbook matching.
-</Info>
-
-## Recommended Approach by Protocol Type
+## Decision framework
 
 | Protocol Type | Recommended Framework | Reason |
 |---------------|----------------------|--------|
@@ -462,9 +298,9 @@ pub fn secure_operation(ctx: Context<Operation>, amount: u64) -> Result<()> {
 | **Token Vesting** | Anchor | Time-based logic, security critical |
 | **DAO Governance** | Anchor | Complex authorization, high risk |
 
-## Security Checklist by Framework
+## Security checklist
 
-### Anchor Security Checklist
+### Anchor
 
 - [ ] Use `Account<'info, T>` for all typed accounts (not `UncheckedAccount`)
 - [ ] Use `Signer<'info>` for authority accounts
@@ -477,47 +313,21 @@ pub fn secure_operation(ctx: Context<Operation>, amount: u64) -> Result<()> {
 - [ ] Add custom `constraint` validations for business logic
 - [ ] Document all `UncheckedAccount` usage with `/// CHECK:` comments
 
-### Pinocchio Security Checklist
+### Pinocchio
 
 - [ ] Check `is_signer()` for all authority accounts
-- [ ] Check `is_owned_by(&crate::ID)` for all program accounts
-- [ ] Validate discriminator before deserialization
+- [ ] Check `owned_by(&crate::ID)` for all program accounts
+- [ ] Validate discriminator / initialization flag before deserialization
 - [ ] Validate program ID before all CPIs
 - [ ] Check initialization status before writing account data
 - [ ] Include user pubkey in all user-specific PDA derivations
-- [ ] Validate account data constraints in instruction logic
+- [ ] Validate account data size before reading fields
+- [ ] Validate instruction data length before parsing
 - [ ] Write comprehensive tests for each validation check
-- [ ] Code review focusing specifically on validation logic
 - [ ] Security audit by experienced Solana auditors
 
-## Final Recommendation
+## Final recommendation
 
-<Note>
-**For 95% of protocols: Use Anchor.**
+For most projects, use Anchor. Its "overhead" is the cost of mandatory security checks that you would need to write by hand in Pinocchio anyway. The code in this repository demonstrates this directly: the secure Pinocchio implementations contain the same validation logic that Anchor generates automatically, but spread across dozens of lines that each represent an opportunity to introduce a bug.
 
-The 5-15% performance difference is **not worth the security risk** unless:
-- You have a team of 3+ experienced Solana developers
-- You're hitting compute budget limits in profiling
-- You have budget for comprehensive security audits
-- Performance benchmarks prove the need
-
-**When in doubt, choose security.** A 10% slower program is infinitely better than a hacked one.
-</Note>
-
-<Tip>
-**The Best Approach:** Start with Anchor, measure performance in production, and optimize the 5-10% of hot paths to Pinocchio only if truly needed. Most protocols never need the optimization.
-</Tip>
-
-## Resources
-
-<CardGroup cols={3}>
-  <Card title="Anchor Documentation" icon="book" href="https://www.anchor-lang.com">
-    Official Anchor framework docs
-  </Card>
-  <Card title="Pinocchio Repository" icon="github" href="https://github.com/anza-xyz/pinocchio">
-    Official Pinocchio framework
-  </Card>
-  <Card title="Security Examples" icon="flask" href="/vulnerabilities/signer-checks">
-    See vulnerabilities in action
-  </Card>
-</CardGroup>
+Optimize to Pinocchio only after profiling shows a genuine compute budget constraint, and only for the specific hot paths that need it. A program that is 10% slower but provably secure is worth more than a program that is 10% faster and missing a signer check.

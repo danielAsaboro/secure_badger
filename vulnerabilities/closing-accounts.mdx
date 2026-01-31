@@ -1,0 +1,528 @@
+---
+title: "Closing Accounts"
+description: "How improper account closing enables revival attacks within the same transaction"
+icon: "xmark"
+---
+
+What happens when we drain lamports but forget to zero the data?
+
+## What we will build
+
+- A **vulnerable** Solana program that closes an account by draining lamports -- but leaves stale data behind
+- A **test** that proves the data survives after closing, enabling a revival attack within the same transaction
+- A **secure** version in both Anchor and Pinocchio that properly zeroes account data before draining
+
+<Note>
+  This tutorial assumes you have Anchor, Solana CLI, and Node.js installed. See the [Quickstart](/quickstart) if you need to set these up.
+</Note>
+
+## The vulnerable program -- Anchor
+
+We start with the account state. A `VaultState` tracks an authority, a balance, and an active flag:
+
+```rust title="programs/closing-accounts/vulnerable/anchor/src/state.rs"
+use anchor_lang::prelude::*;
+
+#[account]
+pub struct VaultState {
+    pub authority: Pubkey,
+    pub balance: u64,
+    pub is_active: bool,
+}
+
+impl VaultState {
+    pub const LEN: usize = 8 + 32 + 8 + 1; // discriminator + pubkey + u64 + bool
+}
+```
+
+Notice that `LEN` includes the 8-byte Anchor discriminator. This is the data that must be zeroed on close.
+
+Next, the `initialize` instruction creates the vault PDA:
+
+```rust title="programs/closing-accounts/vulnerable/anchor/src/instructions/initialize.rs"
+use anchor_lang::prelude::*;
+use crate::state::VaultState;
+
+pub fn initialize(ctx: Context<Initialize>, deposit_amount: u64) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+    vault.authority = ctx.accounts.authority.key();
+    vault.balance = deposit_amount;
+    vault.is_active = true;
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = VaultState::LEN,
+        seeds = [b"vault", authority.key().as_ref()],
+        bump
+    )]
+    pub vault: Account<'info, VaultState>,
+
+    pub system_program: Program<'info, System>,
+}
+```
+
+Now here is the vulnerable `force_close`. It drains lamports but never touches the data buffer:
+
+```rust title="programs/closing-accounts/vulnerable/anchor/src/instructions/force_close.rs"
+use anchor_lang::prelude::*;
+use crate::state::VaultState;
+
+pub fn force_close(ctx: Context<ForceClose>) -> Result<()> {
+    let vault = &ctx.accounts.vault;
+
+    let vault_lamports = vault.to_account_info().lamports();
+    **vault.to_account_info().try_borrow_mut_lamports()? = 0;
+    **ctx.accounts.authority.to_account_info().try_borrow_mut_lamports()? += vault_lamports;
+
+    msg!("Account closed but data NOT zeroed - vulnerable to revival!");
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct ForceClose<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", authority.key().as_ref()],
+        bump,
+        has_one = authority,
+    )]
+    pub vault: Account<'info, VaultState>,
+}
+```
+
+Notice what is missing: no `data.fill(0)`, no `close` constraint. The authority, balance, and `is_active` flag survive in the account data after lamports hit zero.
+
+The entrypoint ties the instructions together:
+
+```rust title="programs/closing-accounts/vulnerable/anchor/src/lib.rs"
+use anchor_lang::prelude::*;
+
+pub mod state;
+pub mod instructions;
+
+use instructions::*;
+
+declare_id!("3k6fBqaWzqPmvHWjLrgpHqJx6BbKZ65zksZjAx24oGLz");
+
+#[program]
+pub mod vulnerable_closing_accounts {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>, deposit_amount: u64) -> Result<()> {
+        instructions::initialize(ctx, deposit_amount)
+    }
+
+    pub fn force_close(ctx: Context<ForceClose>) -> Result<()> {
+        instructions::force_close(ctx)
+    }
+}
+```
+
+## Exploiting it
+
+We initialize a vault, call `force_close`, then check whether the account data was actually wiped:
+
+```typescript title="tests/closing-accounts.test.ts"
+import * as anchor from "@coral-xyz/anchor";
+import { PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
+import { assert } from "chai";
+import BN from "bn.js";
+import type { VulnerableClosingAccounts } from "../target/types/vulnerable_closing_accounts";
+import type { SecureClosingAccounts } from "../target/types/secure_closing_accounts";
+
+describe("Vulnerability: Closing Accounts", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const vulnerableProgram: anchor.Program<VulnerableClosingAccounts> =
+    anchor.workspace.VulnerableClosingAccounts;
+  const secureProgram: anchor.Program<SecureClosingAccounts> =
+    anchor.workspace.SecureClosingAccounts;
+
+  let alice: Keypair;
+  const DEPOSIT_AMOUNT = new BN(1000);
+
+  before(async () => {
+    alice = Keypair.generate();
+    const airdropAmount = 5 * anchor.web3.LAMPORTS_PER_SOL;
+    await provider.connection.requestAirdrop(alice.publicKey, airdropAmount);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  });
+```
+
+You will see the provider and program wired up the same way as every other test in this project. We airdrop SOL to Alice so she can pay for transactions.
+
+Now we derive the vault PDA and initialize it:
+
+```typescript
+  describe("Vulnerable Implementation (Anchor)", () => {
+    let vaultPda: PublicKey;
+
+    before(async () => {
+      [vaultPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("vault"), alice.publicKey.toBuffer()],
+        vulnerableProgram.programId
+      );
+    });
+
+    it("initializes vault with deposit amount", async () => {
+      await vulnerableProgram.methods
+        .initialize(DEPOSIT_AMOUNT)
+        .accounts({
+          authority: alice.publicKey,
+          vault: vaultPda,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice])
+        .rpc();
+
+      const vaultData = await vulnerableProgram.account.vaultState.fetch(vaultPda);
+      assert.ok(vaultData.authority.equals(alice.publicKey));
+      assert.ok(vaultData.balance.eq(DEPOSIT_AMOUNT));
+      assert.ok(vaultData.isActive);
+    });
+```
+
+You will see the vault created on-chain with Alice as authority, balance of 1000, and `isActive` set to `true`.
+
+Next we call `force_close` and inspect the aftermath:
+
+```typescript
+    it("force_close drains lamports but does NOT zero account data", async () => {
+      await vulnerableProgram.methods
+        .forceClose()
+        .accounts({
+          authority: alice.publicKey,
+          vault: vaultPda,
+        })
+        .signers([alice])
+        .rpc();
+
+      const vaultInfoAfter = await provider.connection.getAccountInfo(vaultPda);
+
+      if (vaultInfoAfter !== null) {
+        const data = vaultInfoAfter.data;
+        const isDataZeroed = data.slice(8).every((byte: number) => byte === 0);
+
+        assert.ok(!isDataZeroed, "Data should NOT be zeroed - this is the vulnerability");
+      }
+    });
+  });
+});
+```
+
+You will see the assertion pass: the data is **not** zeroed. The authority, balance, and `is_active` flag are all still sitting in the account buffer after close. The Solana runtime only garbage-collects zero-lamport accounts at the **end** of a transaction, so a subsequent instruction within the same transaction could transfer lamports back in and revive the account with all its original state intact.
+
+Expected output:
+
+```
+EXPLOIT DEMONSTRATION:
+  1. Alice initializes vault with 1000 lamports...
+     Vault initialized
+
+  2. Alice calls force_close...
+     force_close executed successfully
+     VULNERABILITY CONFIRMED:
+     Account data is NOT zeroed after close!
+     Authority still in data: <alice's pubkey>
+     Data zeroed? false
+```
+
+## The fix -- Anchor
+
+We replace manual lamport draining with Anchor's `close` constraint. One attribute handles everything:
+
+```rust title="programs/closing-accounts/secure/anchor/src/instructions/force_close.rs"
+use anchor_lang::prelude::*;
+use crate::state::VaultState;
+
+pub fn force_close(_ctx: Context<ForceClose>) -> Result<()> {
+    msg!("Account properly closed with data zeroed");
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct ForceClose<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", authority.key().as_ref()],
+        bump,
+        has_one = authority,
+        close = authority
+    )]
+    pub vault: Account<'info, VaultState>,
+}
+```
+
+Notice that `close = authority` does three things atomically before the instruction body runs: transfers all lamports to `authority`, fills every byte of account data with zeros, and reassigns ownership to the System Program. Revival is impossible even within the same transaction.
+
+<CodeGroup>
+```rust title="Vulnerable -- manual drain, no zeroing"
+#[derive(Accounts)]
+pub struct ForceClose<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", authority.key().as_ref()],
+        bump,
+        has_one = authority,
+    )]
+    pub vault: Account<'info, VaultState>,
+}
+```
+
+```rust title="Secure -- close constraint"
+#[derive(Accounts)]
+pub struct ForceClose<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"vault", authority.key().as_ref()],
+        bump,
+        has_one = authority,
+        close = authority
+    )]
+    pub vault: Account<'info, VaultState>,
+}
+```
+</CodeGroup>
+
+## The vulnerable program -- Pinocchio
+
+Without a framework, we manage the account lifecycle by hand. The vulnerable `force_close` drains lamports but leaves the data buffer untouched:
+
+```rust title="programs/closing-accounts/vulnerable/pinocchio/src/lib.rs (force_close only)"
+fn force_close(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, vault_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let data = vault_info.try_borrow()?;
+    let vault = VaultState::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    if vault.authority != *authority_info.address() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    drop(data);
+
+    let vault_lamports = vault_info.lamports();
+    vault_info.set_lamports(0);
+    authority_info.set_lamports(authority_info.lamports() + vault_lamports);
+
+    // data.fill(0) is missing -- the 41 bytes survive
+    Ok(())
+}
+```
+
+Notice the pattern: verify authority, drain lamports via `set_lamports()`, return. The 41-byte data buffer (authority pubkey + balance + `is_active` flag) remains intact.
+
+## The fix -- Pinocchio
+
+We add a single critical block -- `data.fill(0)` -- before draining lamports:
+
+```rust title="programs/closing-accounts/secure/pinocchio/src/lib.rs (force_close only)"
+fn force_close(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, vault_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    // Verify authority
+    {
+        let data = vault_info.try_borrow()?;
+        let vault = VaultState::deserialize(&data)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+
+        if vault.authority != *authority_info.address() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+
+    // Zero out account data first
+    {
+        let mut data = vault_info.try_borrow_mut()?;
+        data.fill(0);
+    }
+
+    // Then drain lamports
+    let vault_lamports = vault_info.lamports();
+    vault_info.set_lamports(0);
+    authority_info.set_lamports(authority_info.lamports() + vault_lamports);
+
+    Ok(())
+}
+```
+
+The order matters: zero first, drain second. If we drain first and an error occurs before zeroing, the data survives with zero lamports -- exactly the window an attacker needs.
+
+## Side-by-side comparison
+
+<Tabs>
+  <Tab title="Anchor">
+    <CodeGroup>
+    ```rust title="Vulnerable"
+    pub fn force_close(ctx: Context<ForceClose>) -> Result<()> {
+        let vault = &ctx.accounts.vault;
+
+        let vault_lamports = vault.to_account_info().lamports();
+        **vault.to_account_info().try_borrow_mut_lamports()? = 0;
+        **ctx.accounts.authority.to_account_info().try_borrow_mut_lamports()? += vault_lamports;
+
+        Ok(())
+    }
+
+    #[derive(Accounts)]
+    pub struct ForceClose<'info> {
+        #[account(mut)]
+        pub authority: Signer<'info>,
+
+        #[account(
+            mut,
+            seeds = [b"vault", authority.key().as_ref()],
+            bump,
+            has_one = authority,
+        )]
+        pub vault: Account<'info, VaultState>,
+    }
+    ```
+
+    ```rust title="Secure"
+    pub fn force_close(_ctx: Context<ForceClose>) -> Result<()> {
+        msg!("Account properly closed with data zeroed");
+        Ok(())
+    }
+
+    #[derive(Accounts)]
+    pub struct ForceClose<'info> {
+        #[account(mut)]
+        pub authority: Signer<'info>,
+
+        #[account(
+            mut,
+            seeds = [b"vault", authority.key().as_ref()],
+            bump,
+            has_one = authority,
+            close = authority
+        )]
+        pub vault: Account<'info, VaultState>,
+    }
+    ```
+    </CodeGroup>
+
+    `close = authority` replaces manual lamport manipulation and guarantees zeroed data, lamport transfer, and System Program ownership reassignment.
+  </Tab>
+
+  <Tab title="Pinocchio">
+    <CodeGroup>
+    ```rust title="Vulnerable"
+    fn force_close(accounts: &[AccountView]) -> ProgramResult {
+        // ... authority checks ...
+
+        let vault_lamports = vault_info.lamports();
+        vault_info.set_lamports(0);
+        authority_info.set_lamports(authority_info.lamports() + vault_lamports);
+
+        Ok(())
+    }
+    ```
+
+    ```rust title="Secure"
+    fn force_close(accounts: &[AccountView]) -> ProgramResult {
+        // ... authority checks ...
+
+        {
+            let mut data = vault_info.try_borrow_mut()?;
+            data.fill(0);
+        }
+
+        let vault_lamports = vault_info.lamports();
+        vault_info.set_lamports(0);
+        authority_info.set_lamports(authority_info.lamports() + vault_lamports);
+
+        Ok(())
+    }
+    ```
+    </CodeGroup>
+
+    No framework to help us here. We must explicitly call `data.fill(0)` before draining lamports.
+  </Tab>
+</Tabs>
+
+## Key takeaways
+
+- **Draining lamports is not closing.** The runtime garbage-collects zero-lamport accounts only at the end of a transaction, not between instructions.
+- **In Anchor, use the `close` constraint.** `close = authority` zeros data, drains lamports, and reassigns ownership atomically.
+- **In Pinocchio, call `data.fill(0)` before draining lamports.** Zero first, drain second -- the order prevents a partial-failure revival window.
+- **Revival attacks need only one transaction.** Instruction 1 closes, instruction 2 re-funds, instruction 3 uses the stale data. No special privileges required.
+
+## Run it yourself
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/danielAsaboro/solana_badger
+    cd solana_badger
+    ```
+  </Step>
+
+  <Step title="Install dependencies">
+    ```bash
+    npm install
+    ```
+  </Step>
+
+  <Step title="Build all programs">
+    ```bash
+    anchor build
+    ```
+    You will see compilation output for both the vulnerable and secure variants.
+  </Step>
+
+  <Step title="Run the Anchor closing accounts tests">
+    ```bash
+    anchor test -- --grep "Closing Accounts"
+    ```
+    You will see the vulnerable test confirm that data is NOT zeroed, and the secure test confirm proper cleanup.
+  </Step>
+
+  <Step title="Run the Pinocchio closing accounts tests">
+    ```bash
+    npx jest tests/pinocchio/closing-accounts.pinocchio.test.ts
+    ```
+    You will see the same vulnerable/secure contrast at the raw Pinocchio level.
+  </Step>
+</Steps>

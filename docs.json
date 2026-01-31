@@ -5,11 +5,7 @@
   "colors": {
     "primary": "#14F195",
     "light": "#9945FF",
-    "dark": "#14F195",
-    "anchors": {
-      "from": "#9945FF",
-      "to": "#14F195"
-    }
+    "dark": "#14F195"
   },
   "favicon": "/favicon.svg",
   "navigation": {
@@ -30,7 +26,7 @@
         "tab": "Vulnerabilities",
         "groups": [
           {
-            "group": "🔴 Account Validation",
+            "group": "Account Validation",
             "pages": [
               "vulnerabilities/signer-checks",
               "vulnerabilities/owner-checks",
@@ -38,21 +34,27 @@
             ]
           },
           {
-            "group": "🟠 CPI Vulnerabilities",
+            "group": "CPI Vulnerabilities",
             "pages": [
-              "vulnerabilities/arbitrary-cpi"
+              "vulnerabilities/arbitrary-cpi",
+              "vulnerabilities/closing-accounts"
             ]
           },
           {
-            "group": "🟡 PDAs & Arithmetic",
+            "group": "PDAs & Arithmetic",
             "pages": [
-              "vulnerabilities/pda-sharing"
+              "vulnerabilities/pda-sharing",
+              "vulnerabilities/bump-seed-canonicalization",
+              "vulnerabilities/integer-overflow"
             ]
           },
           {
-            "group": "🟢 Rust & Lifecycle",
+            "group": "Rust & Lifecycle",
             "pages": [
-              "vulnerabilities/reinitialization-attacks"
+              "vulnerabilities/reinitialization-attacks",
+              "vulnerabilities/unsafe-rust",
+              "vulnerabilities/panic-handling",
+              "vulnerabilities/dependency-security"
             ]
           }
         ]
@@ -85,7 +87,7 @@
       "anchors": [
         {
           "anchor": "GitHub Repository",
-          "href": "https://github.com/superteamng/solana-security-reference",
+          "href": "https://github.com/danielAsaboro/solana_badger",
           "icon": "github"
         },
         {
@@ -95,7 +97,7 @@
         },
         {
           "anchor": "Run Tests",
-          "href": "#running-tests",
+          "href": "/quickstart",
           "icon": "flask"
         }
       ]
@@ -109,13 +111,13 @@
     "links": [
       {
         "label": "View on GitHub",
-        "href": "https://github.com/superteamng/solana-security-reference"
+        "href": "https://github.com/danielAsaboro/solana_badger"
       }
     ]
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/superteamng/solana-security-reference",
+      "github": "https://github.com/danielAsaboro/solana_badger",
       "twitter": "https://twitter.com/superteamng"
     }
   }

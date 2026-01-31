@@ -1,0 +1,452 @@
+---
+title: "Integer Overflow/Underflow"
+description: "How unchecked arithmetic operations enable balance manipulation in Solana programs"
+icon: "calculator"
+---
+
+What happens when your program uses plain `+` and `-` in release mode?
+
+## What we will build
+
+In this tutorial we will:
+
+- Write a vulnerable vault program that uses raw arithmetic, then exploit it to wrap a balance from 1000 down to 999 and back up to `u64::MAX`
+- Fix the program with `checked_add` and `checked_sub` and confirm the exploit no longer works
+- Repeat both steps in Pinocchio to see how the same vulnerability manifests without a framework
+
+<Note>
+This tutorial assumes you have already cloned the repository and installed dependencies. If not, run:
+
+```bash
+git clone https://github.com/danielAsaboro/solana_badger.git
+cd solana_badger
+npm install
+anchor build
+```
+</Note>
+
+## The vulnerable vault -- Anchor
+
+We start with a vault that stores an owner and a balance. The program has three instructions: `initialize`, `deposit`, and `withdraw`. Open `programs/integer-overflow/vulnerable/anchor/src/state.rs` -- here is the account we are working with:
+
+```rust state.rs
+use anchor_lang::prelude::*;
+
+#[account]
+pub struct VaultState {
+    pub owner: Pubkey,
+    pub balance: u64,
+}
+
+impl VaultState {
+    pub const LEN: usize = 8 + 32 + 8; // discriminator + pubkey + u64
+}
+```
+
+Now look at the deposit handler in `instructions/deposit.rs`:
+
+```rust instructions/deposit.rs
+use anchor_lang::prelude::*;
+use crate::state::VaultState;
+
+#[derive(Accounts)]
+pub struct Deposit<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", owner.key().as_ref()],
+        bump,
+        has_one = owner
+    )]
+    pub vault: Account<'info, VaultState>,
+
+    pub owner: Signer<'info>,
+}
+
+pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+
+    // VULNERABLE: wrapping addition silently overflows
+    vault.balance = vault.balance.wrapping_add(amount);
+
+    Ok(())
+}
+```
+
+And the withdraw handler in `instructions/withdraw.rs`:
+
+```rust instructions/withdraw.rs
+use anchor_lang::prelude::*;
+use crate::state::VaultState;
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", owner.key().as_ref()],
+        bump,
+        has_one = owner
+    )]
+    pub vault: Account<'info, VaultState>,
+
+    pub owner: Signer<'info>,
+}
+
+pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+
+    // VULNERABLE: wrapping subtraction silently underflows
+    vault.balance = vault.balance.wrapping_sub(amount);
+
+    Ok(())
+}
+```
+
+Notice the two lines that do the arithmetic:
+
+```rust
+vault.balance = vault.balance.wrapping_add(amount);   // deposit
+vault.balance = vault.balance.wrapping_sub(amount);    // withdraw
+```
+
+Solana programs compile to BPF in release mode, where Rust integer overflow wraps silently instead of panicking. So `1000 + u64::MAX` does not produce a gigantic number -- it wraps around to `999`. And `999 - 1000` does not fail -- it wraps to `18446744073709551615`.
+
+## Exploiting the overflow
+
+Let's run the test that demonstrates this. The test lives at `tests/integer-overflow.test.ts`:
+
+```bash
+anchor test -- --grep "Integer Overflow"
+```
+
+Here is what the exploit does. We deposit 1000 into the vault, then deposit `u64::MAX`:
+
+```typescript
+// Step 1: Deposit 1000
+await vulnerableProgram.methods
+  .deposit(new BN(1000))
+  .accounts({ vault: vaultVuln, owner: owner.publicKey })
+  .signers([owner])
+  .rpc();
+
+// Step 2: Deposit u64::MAX -- this wraps 1000 + u64::MAX to 999
+await vulnerableProgram.methods
+  .deposit(U64_MAX)
+  .accounts({ vault: vaultVuln, owner: owner.publicKey })
+  .signers([owner])
+  .rpc();
+```
+
+You will see output like this:
+
+```
+OVERFLOW EXPLOIT DEMONSTRATION:
+  1. Depositing 1000 to give vault a nonzero balance...
+     Vault balance after deposit: 1000
+
+  2. ATTACK: Depositing u64::MAX (18446744073709551615)...
+     Vault balance after overflow: 999
+     VULNERABILITY CONFIRMED: Balance wrapped around!
+```
+
+Notice the balance went from 1000 to 999. We deposited the maximum possible value and the balance *shrank*. The arithmetic wrapped modulo 2^64.
+
+Next, the test withdraws 1000 from the 999 balance:
+
+```typescript
+await vulnerableProgram.methods
+  .withdraw(new BN(1000))
+  .accounts({ vault: vaultVuln, owner: owner.publicKey })
+  .signers([owner])
+  .rpc();
+```
+
+You will see:
+
+```
+UNDERFLOW EXPLOIT DEMONSTRATION:
+  Current balance: 999
+  ATTACK: Withdrawing 1000 from balance of 999
+  Vault balance after underflow: 18446744073709551615
+  VULNERABILITY CONFIRMED: Balance wrapped to massive number!
+```
+
+The balance just went from 999 to `u64::MAX` -- 18.4 quintillion. The attacker now holds the maximum possible balance, minted out of thin air.
+
+## Fixing it -- Anchor
+
+We fix the vault by replacing `wrapping_add` and `wrapping_sub` with `checked_add` and `checked_sub`. These return `Option<u64>` -- `None` when the operation would overflow or underflow -- which we convert into a program error.
+
+Open `programs/integer-overflow/secure/anchor/src/instructions/deposit.rs`:
+
+```rust instructions/deposit.rs (secure)
+pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+
+    vault.balance = vault.balance
+        .checked_add(amount)
+        .ok_or(ErrorCode::Overflow)?;
+
+    Ok(())
+}
+```
+
+And `instructions/withdraw.rs`:
+
+```rust instructions/withdraw.rs (secure)
+pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+
+    require!(amount > 0, ErrorCode::InvalidAmount);
+
+    vault.balance = vault.balance
+        .checked_sub(amount)
+        .ok_or(ErrorCode::Underflow)?;
+
+    Ok(())
+}
+```
+
+The error codes are defined in `lib.rs`:
+
+```rust
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Integer overflow detected")]
+    Overflow,
+    #[msg("Integer underflow detected")]
+    Underflow,
+    #[msg("Invalid amount")]
+    InvalidAmount,
+}
+```
+
+The diff is two lines:
+
+```diff
+- vault.balance = vault.balance.wrapping_add(amount);
++ vault.balance = vault.balance
++     .checked_add(amount)
++     .ok_or(ErrorCode::Overflow)?;
+
+- vault.balance = vault.balance.wrapping_sub(amount);
++ vault.balance = vault.balance
++     .checked_sub(amount)
++     .ok_or(ErrorCode::Underflow)?;
+```
+
+The secure test (in the same test file) confirms the fix works. You will see:
+
+```
+FIX DEMONSTRATION (Overflow):
+  1. Depositing 1000 to give vault a nonzero balance...
+     Vault balance: 1000
+
+  2. ATTACK ATTEMPT: Depositing u64::MAX...
+     FIX CONFIRMED: Overflow deposit rejected!
+     Balance unchanged at: 1000
+
+FIX DEMONSTRATION (Underflow):
+  Current balance: 1000
+  ATTACK ATTEMPT: Withdrawing 2000 from balance of 1000
+  FIX CONFIRMED: Underflow withdrawal rejected!
+  Balance unchanged at: 1000
+```
+
+Both attacks are blocked. The balance stays at 1000.
+
+## The vulnerable vault -- Pinocchio
+
+Now let's see the same vulnerability without a framework. Open `programs/integer-overflow/vulnerable/pinocchio/src/lib.rs`. The relevant functions are `deposit` and `withdraw`:
+
+```rust
+fn deposit(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    // ... account validation ...
+
+    // VULNERABLE: plain addition wraps on overflow
+    let new_balance = vault.balance + amount;
+
+    let owner_bytes: [u8; 32] = owner_info.address().as_ref().try_into().unwrap();
+    VaultState::serialize(&owner_bytes, new_balance, &mut data);
+
+    Ok(())
+}
+
+fn withdraw(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    // ... account validation ...
+
+    // VULNERABLE: plain subtraction wraps on underflow
+    let new_balance = vault.balance - amount;
+
+    let owner_bytes: [u8; 32] = owner_info.address().as_ref().try_into().unwrap();
+    VaultState::serialize(&owner_bytes, new_balance, &mut data);
+
+    Ok(())
+}
+```
+
+In a `no_std` Pinocchio program compiled to BPF, there is no panic handler that saves us. The wrapping is completely silent.
+
+We run the Pinocchio tests:
+
+```bash
+npx ts-mocha -p ./tsconfig.json -t 1000000 tests/pinocchio/integer-overflow.pinocchio.test.ts
+```
+
+You will see the same overflow and underflow behavior as the Anchor version.
+
+## Fixing it -- Pinocchio
+
+We replace plain operators with their `checked_` equivalents:
+
+```rust
+fn deposit(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    // ... account validation ...
+
+    let new_balance = vault.balance
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    let owner_bytes: [u8; 32] = owner_info.address().as_ref().try_into().unwrap();
+    VaultState::serialize(&owner_bytes, new_balance, &mut data);
+
+    Ok(())
+}
+
+fn withdraw(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    // ... account validation ...
+
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let new_balance = vault.balance
+        .checked_sub(amount)
+        .ok_or(ProgramError::InsufficientFunds)?;
+
+    let owner_bytes: [u8; 32] = owner_info.address().as_ref().try_into().unwrap();
+    VaultState::serialize(&owner_bytes, new_balance, &mut data);
+
+    Ok(())
+}
+```
+
+The pattern is identical to Anchor: `+` becomes `checked_add`, `-` becomes `checked_sub`, and `None` maps to a `ProgramError`.
+
+## Side-by-side comparison
+
+<Tabs>
+  <Tab title="Anchor">
+    <CodeGroup>
+    ```rust Vulnerable
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.balance = vault.balance.wrapping_add(amount);
+        Ok(())
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.balance = vault.balance.wrapping_sub(amount);
+        Ok(())
+    }
+    ```
+
+    ```rust Secure
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.balance = vault.balance
+            .checked_add(amount)
+            .ok_or(ErrorCode::Overflow)?;
+        Ok(())
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        vault.balance = vault.balance
+            .checked_sub(amount)
+            .ok_or(ErrorCode::Underflow)?;
+        Ok(())
+    }
+    ```
+    </CodeGroup>
+  </Tab>
+  <Tab title="Pinocchio">
+    <CodeGroup>
+    ```rust Vulnerable
+    fn deposit(accounts: &[AccountView], amount: u64) -> ProgramResult {
+        // ... account validation ...
+        let new_balance = vault.balance + amount;
+        VaultState::serialize(&owner_bytes, new_balance, &mut data);
+        Ok(())
+    }
+
+    fn withdraw(accounts: &[AccountView], amount: u64) -> ProgramResult {
+        // ... account validation ...
+        let new_balance = vault.balance - amount;
+        VaultState::serialize(&owner_bytes, new_balance, &mut data);
+        Ok(())
+    }
+    ```
+
+    ```rust Secure
+    fn deposit(accounts: &[AccountView], amount: u64) -> ProgramResult {
+        // ... account validation ...
+        let new_balance = vault.balance
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        VaultState::serialize(&owner_bytes, new_balance, &mut data);
+        Ok(())
+    }
+
+    fn withdraw(accounts: &[AccountView], amount: u64) -> ProgramResult {
+        // ... account validation ...
+        let new_balance = vault.balance
+            .checked_sub(amount)
+            .ok_or(ProgramError::InsufficientFunds)?;
+        VaultState::serialize(&owner_bytes, new_balance, &mut data);
+        Ok(())
+    }
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+## Key takeaways
+
+- **Solana BPF is release mode.** Rust's debug-mode overflow panics do not exist in deployed programs. The `+` and `-` operators wrap silently.
+
+- **Use `checked_add`, `checked_sub`, `checked_mul`, and `checked_div` for all arithmetic on user-influenced values.** The performance cost is negligible.
+
+- **Underflow is the more dangerous direction.** An overflow reduces a balance. An underflow inflates it to `u64::MAX` -- effectively minting tokens out of thin air.
+
+- **`overflow-checks = true` in Cargo.toml is a safety net, not a fix.** It can be overridden by workspace settings or profile inheritance. Explicit checked arithmetic is the only reliable defense.
+
+## Run it yourself
+
+<Steps>
+  <Step title="Build the programs">
+    ```bash
+    anchor build
+    ```
+  </Step>
+  <Step title="Run the Anchor tests">
+    ```bash
+    anchor test -- --grep "Integer Overflow"
+    ```
+
+    You will see the overflow wrap 1000 to 999 and the underflow wrap 999 to `u64::MAX`, followed by the secure version rejecting both attacks.
+  </Step>
+  <Step title="Run the Pinocchio tests">
+    ```bash
+    npx ts-mocha -p ./tsconfig.json -t 1000000 tests/pinocchio/integer-overflow.pinocchio.test.ts
+    ```
+
+    You will see the same overflow and underflow behavior, and the secure Pinocchio version catching both.
+  </Step>
+</Steps>
+
+<Note>
+The full source for both vulnerable and secure implementations lives at
+[`programs/integer-overflow/`](https://github.com/danielAsaboro/solana_badger/tree/main/programs/integer-overflow) in the repository.
+</Note>

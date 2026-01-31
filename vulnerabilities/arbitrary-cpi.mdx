@@ -1,388 +1,788 @@
 ---
-title: "Arbitrary CPI Attacks"
-description: "How unvalidated cross-program invocations enable malicious program execution"
+title: "Arbitrary CPI"
+description: "How unvalidated cross-program invocations let attackers substitute malicious programs and steal funds"
 icon: "arrows-rotate"
 ---
 
+Cross-Program Invocations (CPIs) are the backbone of composability on Solana. But if we invoke a program without verifying its identity, an attacker can swap in a malicious substitute that reverses transfers, drains funds, or hijacks authority. In this tutorial we will build a vulnerable token vault, exploit it, and then fix it -- in both Anchor and Pinocchio.
+
+## What we will build
+
+- A token vault program that transfers tokens via CPI to an **unvalidated** program account
+- A test that proves an attacker can pass an arbitrary program ID through the validation layer
+- A secure version that pins the CPI target to the real SPL Token program, blocking the attack
+
 <Note>
-**🟠 Security Matrix: CPI Vulnerabilities (Top Left)**
+  **Prerequisites** -- Before starting, clone the repository and install dependencies:
 
-**Frequency:** Rare | **Impact:** Critical
+  ```bash
+  git clone https://github.com/danielAsaboro/solana_badger.git
+  cd solana_badger
+  npm install
+  ```
 
-*Less common, but devastating when exploited.*
+  You will need Anchor, the Solana CLI, and Node.js already installed.
 </Note>
 
-# Arbitrary CPI Attacks
+## Step 1: Understand the vulnerable program (Anchor)
 
-<CardGroup cols={2}>
-  <Card title="Severity" icon="circle-exclamation">
-    **High** - Enables unauthorized program execution with your authority
-  </Card>
-  <Card title="Difficulty" icon="gauge">
-    **Intermediate** - Requires understanding of CPIs
-  </Card>
-</CardGroup>
-
-## Overview
-
-<Warning>
-Arbitrary CPI attacks transform your secure program into a **launcher for malicious code**, allowing attackers to hijack your program's authority!
-</Warning>
-
-Arbitrary CPI (Cross-Program Invocation) vulnerabilities occur when programs blindly invoke whatever program is passed as a parameter, without validating the program ID. This allows attackers to substitute malicious programs that execute under your program's authority.
-
-## Attack Flow Diagram
-
-```mermaid
-sequenceDiagram
-    participant Attacker
-    participant VaultProgram
-    participant FakeTokenProgram
-    participant AttackerWallet
-
-    Attacker->>VaultProgram: transfer_tokens(fake_token_program)
-    Note over Attacker: Passes MALICIOUS program!
-    VaultProgram->>VaultProgram: ❌ No program ID check
-    VaultProgram->>FakeTokenProgram: CPI: transfer(vault → destination)
-    Note over FakeTokenProgram: Executes MALICIOUS logic
-    FakeTokenProgram->>AttackerWallet: Transfer reversed: destination → attacker!
-    Note over VaultProgram: Authority hijacked!
-```
-
-## The Vulnerability
-
-<Tabs>
-  <Tab title="Anchor - Vulnerable">
-    ### Accepts Any Program for CPI
-
-    ```rust filename="programs/arbitrary-cpi/vulnerable/anchor/src/instructions/transfer_tokens.rs"
-    use anchor_lang::prelude::*;
-    use anchor_spl::token::{self, Transfer};
-
-    pub fn transfer_tokens(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
-        // VULNERABILITY: Calling CPI on unvalidated token_program!
-        // token_program could be ANYTHING the attacker passes in
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.destination.to_account_info(),
-            authority: ctx.accounts.vault.to_account_info(),
-        };
-
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-
-        // DANGER: Invoking UNVERIFIED program with vault authority!
-        token::transfer(
-            CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds),
-            amount,
-        )?;
-
-        Ok(())
-    }
-
-    #[derive(Accounts)]
-    pub struct TransferTokens<'info> {
-        pub authority: Signer<'info>,
-        pub vault: Account<'info, Vault>,
-
-        #[account(mut)]
-        pub vault_token_account: UncheckedAccount<'info>,
-
-        #[account(mut)]
-        pub destination: UncheckedAccount<'info>,
-
-        // VULNERABILITY: UncheckedAccount for token_program!
-        // Attacker can pass ANY program ID here
-        /// CHECK: INTENTIONALLY VULNERABLE - no program ID validation
-        pub token_program: UncheckedAccount<'info>,
-    }
-    ```
-
-    <Accordion title="Why is this dangerous?">
-      **What the attacker does:**
-      1. Deploy a malicious program with the same CPI interface as SPL Token
-      2. Make it do the OPPOSITE: instead of transferring vault → destination, it transfers destination → attacker
-      3. Pass the malicious program as `token_program` parameter
-      4. Your program invokes the malicious code with vault PDA authority
-
-      **The malicious program inherits your authority** and can do anything the vault PDA could do!
-    </Accordion>
-  </Tab>
-
-  <Tab title="Pinocchio - Vulnerable">
-    ### Missing Program ID Check
-
-    ```rust filename="programs/arbitrary-cpi/vulnerable/pinocchio/src/lib.rs"
-    pub fn transfer_tokens(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
-        let [
-            authority_info,
-            vault_info,
-            vault_token_info,
-            destination_info,
-            token_program_info,  // Could be MALICIOUS!
-        ] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
-
-        // VULNERABILITY: No check that token_program_info.key() == spl_token::ID
-        // Attacker can pass ANY program here!
-
-        // Build CPI instruction
-        let transfer_instruction = spl_token::instruction::transfer(
-            token_program_info.key(),  // Using UNVERIFIED program!
-            vault_token_info.key(),
-            destination_info.key(),
-            vault_pda,
-            &[vault_pda],
-            amount,
-        )?;
-
-        // DANGER: Invoking with vault authority, but could be malicious program!
-        invoke_signed(&transfer_instruction, accounts, signer_seeds)?;
-
-        Ok(())
-    }
-    ```
-
-    <Info>
-    Pinocchio gives you complete control but requires explicit program ID validation. **Always verify program IDs before CPI!**
-    </Info>
-  </Tab>
-</Tabs>
-
-## Real-World Exploit Demo
-
-<Steps>
-  <Step title="Setup: Vault holds 1000 tokens">
-    Legitimate vault program designed to transfer tokens via SPL Token CPI
-  </Step>
-  <Step title="Attacker deploys fake token program">
-    Malicious program with same interface but **reversed** logic
-  </Step>
-  <Step title="Attacker calls vault with fake program">
-    Passes malicious program ID instead of real SPL Token program
-  </Step>
-  <Step title="Vault invokes fake program">
-    Vault's PDA authority signs the CPI to the **malicious** program
-  </Step>
-  <Step title="Fake program drains vault">
-    Instead of vault → destination, executes destination → attacker
-  </Step>
-  <Step title="Vault drained">
-    All tokens stolen using the vault's own authority!
-  </Step>
-</Steps>
+We start with a vault that accepts a `token_program` account as `UncheckedAccount`. This means the runtime will accept whatever program ID the caller provides -- no questions asked.
 
 <CodeGroup>
-```typescript Test: Exploit Works
-it("should allow attacker to hijack CPI", async () => {
-  // Setup vault with tokens
-  await initializeVault(vault, 1000);
+```rust transfer_tokens.rs
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{self, instruction::{AccountMeta, Instruction}};
+use anchor_spl::token::TokenAccount;
+use crate::state::Vault;
 
-  // Attacker deploys FAKE token program
-  const fakeTokenProgram = await deployMaliciousProgram();
+pub fn transfer_tokens(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
+    msg!("Transferring {} tokens from vault", amount);
+    msg!("WARNING: Using arbitrary program without validation!");
 
-  // Attacker calls vault with FAKE program
-  await vaultProgram.methods.transferTokens(new BN(500))
-    .accounts({
-      vault: vaultPda,
-      destination: attackerTokenAccount,
-      tokenProgram: fakeTokenProgram.publicKey,  // MALICIOUS!
-    })
-    .signers([attacker])
-    .rpc();
+    // Manually construct SPL Token transfer instruction
+    // Instruction index 3 = Transfer in SPL Token program
+    let mut data = vec![3u8];
+    data.extend_from_slice(&amount.to_le_bytes());
 
-  // Attacker's fake program reversed the transfer!
-  const attackerBalance = await getTokenBalance(attackerTokenAccount);
-  expect(attackerBalance).toEqual(500);  // Stolen!
-});
+    let transfer_ix = Instruction {
+        program_id: ctx.accounts.token_program.key(),
+        accounts: vec![
+            AccountMeta::new(ctx.accounts.source.key(), false),
+            AccountMeta::new(ctx.accounts.destination.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.authority.key(), true),
+        ],
+        data,
+    };
+
+    solana_program::program::invoke(
+        &transfer_ix,
+        &[
+            ctx.accounts.source.to_account_info(),
+            ctx.accounts.destination.to_account_info(),
+            ctx.accounts.authority.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ],
+    )?;
+
+    msg!("Transfer completed (or was it?)");
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct TransferTokens<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"vault", authority.key().as_ref()],
+        bump = vault.bump,
+        constraint = vault.authority == authority.key() @ ErrorCode::UnauthorizedAuthority
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(
+        mut,
+        constraint = source.key() == vault.token_account @ ErrorCode::InvalidSourceAccount
+    )]
+    pub source: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub destination: Account<'info, TokenAccount>,
+
+    /// CHECK: This account is NOT checked -- that is the vulnerability.
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Only the vault authority can authorize transfers")]
+    UnauthorizedAuthority,
+
+    #[msg("Source must be the vault's token account")]
+    InvalidSourceAccount,
+}
 ```
 
-```bash Expected Output
-⚠️  VULNERABILITY: Malicious program executed with vault authority
-✓ should allow attacker to hijack CPI (456ms)
+```rust state.rs
+use anchor_lang::prelude::*;
 
-Tokens stolen: 500
+#[account]
+pub struct Vault {
+    pub authority: Pubkey,
+    pub token_account: Pubkey,
+    pub bump: u8,
+}
+
+impl Vault {
+    pub const LEN: usize = 8 + // discriminator
+        32 + // authority
+        32 + // token_account
+        1; // bump
+}
+```
+
+```rust lib.rs (dispatcher)
+use anchor_lang::prelude::*;
+
+declare_id!("J9nJgXQ2pckccZdRb6zuRXJiupqF7AJN7yFzzJTHepkz");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod vulnerable_arbitrary_cpi {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        instructions::initialize(ctx)
+    }
+
+    pub fn transfer_tokens(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
+        instructions::transfer_tokens(ctx, amount)
+    }
+}
 ```
 </CodeGroup>
 
-## The Fix
+The critical line is in the `TransferTokens` accounts struct:
 
-<Tabs>
-  <Tab title="Anchor - Fix #1: Program Type">
-    ### Use Program<'info, T> (Recommended)
+```rust
+pub token_program: UncheckedAccount<'info>,
+```
 
-    ```rust filename="programs/arbitrary-cpi/secure/anchor/src/instructions/transfer_tokens.rs"
-    use anchor_spl::token::{Token, TokenAccount};
+Notice that the program validates the signer, the vault PDA, and the source token account. All of those checks pass. But the program that actually executes the transfer is entirely attacker-controlled -- `UncheckedAccount` performs zero validation on the program ID.
 
-    #[derive(Accounts)]
-    pub struct TransferTokens<'info> {
-        pub authority: Signer<'info>,
-        pub vault: Account<'info, Vault>,
+## Step 2: Exploit the vulnerability
 
-        #[account(mut)]
-        pub vault_token_account: Account<'info, TokenAccount>,
+Now we write a test that passes `attacker.publicKey` as the `tokenProgram` account. Because the program uses `UncheckedAccount`, it accepts this arbitrary key without complaint.
 
-        #[account(mut)]
-        pub destination: Account<'info, TokenAccount>,
+```typescript
+it("demonstrates vulnerability: UncheckedAccount accepts ANY program ID", async () => {
+  const vaultBefore = await getAccount(provider.connection, vaultTokenAccount);
 
-        // FIX: Program<'info, Token> validates program ID automatically
-        pub token_program: Program<'info, Token>,
-    }
-    ```
+  let errorMessage = "";
+  try {
+    await vulnerableProgram.methods
+      .transferTokens(new BN(TRANSFER_AMOUNT))
+      .accounts({
+        authority: authority.publicKey,
+        source: vaultTokenAccount,
+        destination: destinationTokenAccount,
+        tokenProgram: attacker.publicKey, // ATTACK: Wrong program!
+      })
+      .signers([authority])
+      .rpc();
+  } catch (error: unknown) {
+    errorMessage = error instanceof Error ? error.message : String(error);
+  }
 
-    <Accordion title="How this prevents the attack">
-      `Program<'info, Token>` forces Anchor to verify:
-      - `token_program.key() == anchor_spl::token::ID`
-      - Program ID matches the expected SPL Token program
-      - Rejects any other program with `InvalidProgramId` error
+  const vaultAfter = await getAccount(provider.connection, vaultTokenAccount);
+  assert.equal(
+    Number(vaultBefore.amount),
+    Number(vaultAfter.amount),
+    "Vault balance should be unchanged (CPI failed)"
+  );
+});
+```
 
-      Attackers **cannot** substitute malicious programs.
-    </Accordion>
-  </Tab>
+You will see output similar to:
 
-  <Tab title="Anchor - Fix #2: Manual Check">
-    ### Explicit Program ID Validation
+```bash
+VULNERABILITY DEMONSTRATION:
+  The vulnerable program uses UncheckedAccount<'info> for token_program.
+  This allows ANY program ID to be passed without validation.
 
-    ```rust
-    pub fn transfer_tokens(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
-        // FIX: Manual program ID check
-        if ctx.accounts.token_program.key() != anchor_spl::token::ID {
-            return Err(ProgramError::IncorrectProgramId.into());
-        }
+  ATTACK: Passing attacker's pubkey as token_program...
+  Transaction failed at CPI level (expected)
 
-        // Safe to perform CPI now
-        token::transfer(/* ... */)?;
-        Ok(())
-    }
-    ```
-  </Tab>
+  VULNERABILITY CONFIRMED:
+  - Program accepted arbitrary program ID
+  - Failed only because attacker.publicKey isn't a deployed program
+  - A malicious program with same interface would execute!
+```
 
-  <Tab title="Pinocchio - Secure">
-    ### Add Program ID Check
+Notice that the vault did not lose tokens only because the attacker key is not an executable program. If the attacker had deployed a program at that address with the same instruction layout, the CPI would have succeeded and tokens would have moved wherever the malicious program directed them.
 
-    ```rust filename="programs/arbitrary-cpi/secure/pinocchio/src/lib.rs"
-    pub fn transfer_tokens(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
-        let [
-            authority_info,
-            vault_info,
-            vault_token_info,
-            destination_info,
-            token_program_info,
-        ] = accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
+## Step 3: Fix the vulnerability (Anchor)
 
-        // FIX: Validate token program ID BEFORE CPI
-        if token_program_info.key() != &spl_token::ID {
-            return Err(ProgramError::IncorrectProgramId);
-        }
-
-        // Safe to perform CPI now - we know it's the real SPL Token program
-        let transfer_instruction = spl_token::instruction::transfer(
-            token_program_info.key(),
-            vault_token_info.key(),
-            destination_info.key(),
-            vault_pda,
-            &[vault_pda],
-            amount,
-        )?;
-
-        invoke_signed(&transfer_instruction, accounts, signer_seeds)?;
-        Ok(())
-    }
-    ```
-
-    <Info>
-    **Best Practice:** Always validate program IDs before CPI. Place checks immediately after account parsing.
-    </Info>
-  </Tab>
-
-  <Tab title="Anchor - Fix #3: CPI Helper">
-    ### Use Anchor's CPI Module
-
-    ```rust
-    // Using anchor_spl's CPI helper functions
-    use anchor_spl::token;
-
-    pub fn transfer_tokens(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
-        // FIX: Using anchor_spl::token::transfer() with Program type
-        // Program type ensures correct program ID automatically
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                token::Transfer {
-                    from: ctx.accounts.vault_token_account.to_account_info(),
-                    to: ctx.accounts.destination.to_account_info(),
-                    authority: ctx.accounts.vault.to_account_info(),
-                },
-                signer_seeds,
-            ),
-            amount,
-        )?;
-
-        Ok(())
-    }
-    ```
-
-    <Tip>
-    Anchor's CPI helpers combined with `Program<'info, T>` type provide the **safest** approach - both compile-time and runtime validation.
-    </Tip>
-  </Tab>
-</Tabs>
-
-## Testing the Fix
+We replace `UncheckedAccount<'info>` with `Program<'info, Token>`. Anchor will automatically reject any account whose key does not match `spl_token::ID`.
 
 <CodeGroup>
-```typescript Test: Exploit Blocked
-it("should reject fake token program", async () => {
-  // Attacker deploys FAKE token program
-  const fakeTokenProgram = await deployMaliciousProgram();
+```rust Secure transfer_tokens.rs
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use crate::state::Vault;
 
-  // Attacker tries to pass fake program
+pub fn transfer_tokens(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
+    msg!("Transferring {} tokens from vault", amount);
+    msg!("Using validated Token program: {}", ctx.accounts.token_program.key());
+
+    let cpi_accounts = Transfer {
+        from: ctx.accounts.source.to_account_info(),
+        to: ctx.accounts.destination.to_account_info(),
+        authority: ctx.accounts.authority.to_account_info(),
+    };
+    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+
+    token::transfer(cpi_ctx, amount)?;
+
+    msg!("Transfer completed successfully");
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct TransferTokens<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"vault", authority.key().as_ref()],
+        bump = vault.bump,
+        constraint = vault.authority == authority.key() @ ErrorCode::UnauthorizedAuthority
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(
+        mut,
+        constraint = source.key() == vault.token_account @ ErrorCode::InvalidSourceAccount
+    )]
+    pub source: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub destination: Account<'info, TokenAccount>,
+
+    /// FIX: Program<'info, Token> validates token_program.key() == spl_token::ID
+    pub token_program: Program<'info, Token>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Only the vault authority can authorize transfers")]
+    UnauthorizedAuthority,
+
+    #[msg("Source must be the vault's token account")]
+    InvalidSourceAccount,
+}
+```
+
+```rust Vulnerable transfer_tokens.rs
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::{self, instruction::{AccountMeta, Instruction}};
+use anchor_spl::token::TokenAccount;
+use crate::state::Vault;
+
+pub fn transfer_tokens(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
+    msg!("Transferring {} tokens from vault", amount);
+    msg!("WARNING: Using arbitrary program without validation!");
+
+    let mut data = vec![3u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+
+    let transfer_ix = Instruction {
+        program_id: ctx.accounts.token_program.key(),
+        accounts: vec![
+            AccountMeta::new(ctx.accounts.source.key(), false),
+            AccountMeta::new(ctx.accounts.destination.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.authority.key(), true),
+        ],
+        data,
+    };
+
+    solana_program::program::invoke(
+        &transfer_ix,
+        &[
+            ctx.accounts.source.to_account_info(),
+            ctx.accounts.destination.to_account_info(),
+            ctx.accounts.authority.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+        ],
+    )?;
+
+    msg!("Transfer completed (or was it?)");
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct TransferTokens<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"vault", authority.key().as_ref()],
+        bump = vault.bump,
+        constraint = vault.authority == authority.key() @ ErrorCode::UnauthorizedAuthority
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(
+        mut,
+        constraint = source.key() == vault.token_account @ ErrorCode::InvalidSourceAccount
+    )]
+    pub source: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub destination: Account<'info, TokenAccount>,
+
+    /// CHECK: This account is NOT checked -- that is the vulnerability.
+    pub token_program: UncheckedAccount<'info>,
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Only the vault authority can authorize transfers")]
+    UnauthorizedAuthority,
+
+    #[msg("Source must be the vault's token account")]
+    InvalidSourceAccount,
+}
+```
+</CodeGroup>
+
+The entire fix is a single type change:
+
+```rust
+// Vulnerable
+pub token_program: UncheckedAccount<'info>,
+
+// Secure
+pub token_program: Program<'info, Token>,
+```
+
+`Program<'info, Token>` asserts `token_program.key() == spl_token::ID` before any instruction handler runs. Any other program ID causes the transaction to fail immediately. The instruction body also improves -- instead of manually constructing a raw `Instruction` and calling `solana_program::program::invoke`, we use `anchor_spl::token::transfer` with a `CpiContext`, which adds another layer of type-safety.
+
+## Step 4: Confirm the fix blocks the attack
+
+The secure test proves that the same attack is now rejected:
+
+```typescript
+it("REJECTS arbitrary program IDs with Program<Token> validation", async () => {
+  const vaultBefore = await getAccount(provider.connection, secureVaultTokenAccount);
+
+  let attackFailed = false;
   try {
-    await vaultProgram.methods.transferTokens(new BN(500))
-      .accounts({
-        vault: vaultPda,
-        destination: attackerTokenAccount,
-        tokenProgram: fakeTokenProgram.publicKey,  // FAKE!
+    const txBuilder = secureProgram.methods.transferTokens(new BN(TRANSFER_AMOUNT));
+
+    await (txBuilder as any)
+      .accountsPartial({
+        authority: authority.publicKey,
+        source: secureVaultTokenAccount,
+        destination: secureDestinationTokenAccount,
+        tokenProgram: attacker.publicKey, // ATTACK: Try to override!
       })
-      .signers([attacker])
+      .signers([authority])
       .rpc();
 
     assert.fail("Expected transaction to fail");
-  } catch (err) {
-    // FIX CONFIRMED: Fake program rejected
-    expect(err.toString()).toContain("InvalidProgramId");
+  } catch (error: unknown) {
+    attackFailed = true;
   }
+
+  assert.ok(attackFailed, "Attack should have been rejected");
+
+  const vaultAfter = await getAccount(provider.connection, secureVaultTokenAccount);
+  assert.equal(
+    Number(vaultBefore.amount),
+    Number(vaultAfter.amount),
+    "Vault balance should be unchanged (attack rejected)"
+  );
 });
 ```
 
-```bash Expected Output
-✓ should reject fake token program (203ms)
+You will see the transaction fail during account deserialization, before the instruction handler even runs. The vault balance remains unchanged.
 
-Error: InvalidProgramId
-✅ FIX CONFIRMED: Malicious program rejected
+## Step 5: Understand the vulnerable program (Pinocchio)
+
+In Pinocchio we work at a lower level. The vulnerable version accepts `token_program_info` as the fifth account and performs the CPI without comparing it to `SPL_TOKEN_PROGRAM_ID`:
+
+```rust
+#![no_std]
+
+#[cfg(not(feature = "no-entrypoint"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+
+pub mod state;
+use state::Vault;
+
+const ID: Address = Address::new_from_array([
+    0xc9, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
+]);
+
+// SPL Token program ID: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+const SPL_TOKEN_PROGRAM_ID: Address = Address::new_from_array([
+    0x06, 0xdd, 0xf6, 0xe1, 0xd7, 0x65, 0xa1, 0x93,
+    0xd9, 0xcb, 0xe1, 0x46, 0xce, 0xeb, 0x79, 0xac,
+    0x1c, 0xb4, 0x85, 0xed, 0x5f, 0x5b, 0x37, 0x91,
+    0x3a, 0x8c, 0xf5, 0x85, 0x7e, 0xff, 0x00, 0xa9,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize(accounts, instruction_data),
+        Some(&1) => transfer_tokens(accounts, instruction_data),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+/// Accounts expected:
+/// 0. `[signer]` Authority
+/// 1. `[writable]` Vault PDA
+/// 2. `[]` Vault token account
+/// 3. `[]` System program
+fn initialize(accounts: &[AccountView], instruction_data: &[u8]) -> ProgramResult {
+    let [authority_info, vault_info, vault_token_account_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let bump = *instruction_data.get(1).ok_or(ProgramError::InvalidInstructionData)?;
+
+    let mut vault_data = vault_info.try_borrow_mut()?;
+
+    if vault_data.len() < Vault::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let vault = Vault {
+        authority: authority_info.address().clone(),
+        token_account: vault_token_account_info.address().clone(),
+        bump,
+    };
+
+    vault.to_bytes(&mut vault_data).map_err(|_| ProgramError::AccountDataTooSmall)?;
+
+    Ok(())
+}
+
+/// VULNERABLE: token_program at index 4 is never validated.
+///
+/// Accounts expected:
+/// 0. `[signer]` Authority
+/// 1. `[]` Vault PDA
+/// 2. `[writable]` Source token account
+/// 3. `[writable]` Destination token account
+/// 4. `[]` Token program (UNCHECKED)
+fn transfer_tokens(accounts: &[AccountView], instruction_data: &[u8]) -> ProgramResult {
+    let [authority_info, vault_info, source_info, destination_info, token_program_info] = accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let vault_data = vault_info.try_borrow()?;
+    let vault = Vault::from_bytes(&vault_data).map_err(|_| ProgramError::InvalidAccountData)?;
+
+    if authority_info.address() != &vault.authority {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if source_info.address() != &vault.token_account {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let amount_bytes: [u8; 8] = instruction_data
+        .get(1..9)
+        .ok_or(ProgramError::InvalidInstructionData)?
+        .try_into()
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+    let amount = u64::from_le_bytes(amount_bytes);
+
+    // No validation that token_program_info is the real SPL Token program
+    use pinocchio_token::instructions::Transfer;
+    Transfer {
+        from: source_info,
+        to: destination_info,
+        authority: authority_info,
+        amount,
+    }
+    .invoke()?;
+
+    Ok(())
+}
 ```
-</CodeGroup>
 
-## Security Checklist
+Notice that the `SPL_TOKEN_PROGRAM_ID` constant is defined at the top of the file but never used. The `transfer_tokens` function validates the signer, the vault PDA, the authority, and the source account -- but never checks `token_program_info.address()`. The CPI proceeds to whatever program the caller places at account index 4.
 
-- [ ] All CPI targets use `Program<'info, T>` type (Anchor)
-- [ ] Or all program IDs explicitly validated before CPI (Pinocchio)
-- [ ] Program ID constants match expected programs (spl_token::ID, etc.)
-- [ ] Tests verify that wrong program IDs are rejected
-- [ ] Code review confirms NO `UncheckedAccount` for CPI targets
+## Step 6: Fix the vulnerability (Pinocchio)
 
-## Resources & Next Steps
+We add a single guard before the CPI:
 
-<CardGroup cols={3}>
-  <Card title="View Source Code" icon="code" href="https://github.com/superteamng/solana-security-reference/tree/main/programs/arbitrary-cpi">
-    Browse vulnerable and secure CPI implementations
-  </Card>
-  <Card title="Run Tests" icon="flask" href="https://github.com/superteamng/solana-security-reference/tree/main/tests">
-    See CPI hijacking attacks demonstrated
-  </Card>
-  <Card title="Next: Reinitialization" icon="arrow-right" href="/vulnerabilities/reinitialization-attacks">
-    Learn about account lifecycle vulnerabilities
-  </Card>
-</CardGroup>
+```rust
+#![no_std]
+
+#[cfg(not(feature = "no-entrypoint"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+use pinocchio::{
+    entrypoint,
+    AccountView,
+    Address,
+    ProgramResult,
+};
+use solana_program_error::ProgramError;
+
+pub mod state;
+use state::Vault;
+
+const ID: Address = Address::new_from_array([
+    0xc9, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+    0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+    0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+    0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+]);
+
+// SPL Token program ID: TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA
+const SPL_TOKEN_PROGRAM_ID: Address = Address::new_from_array([
+    0x06, 0xdd, 0xf6, 0xe1, 0xd7, 0x65, 0xa1, 0x93,
+    0xd9, 0xcb, 0xe1, 0x46, 0xce, 0xeb, 0x79, 0xac,
+    0x1c, 0xb4, 0x85, 0xed, 0x5f, 0x5b, 0x37, 0x91,
+    0x3a, 0x8c, 0xf5, 0x85, 0x7e, 0xff, 0x00, 0xa9,
+]);
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if program_id != &ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    match instruction_data.first() {
+        Some(&0) => initialize(accounts, instruction_data),
+        Some(&1) => transfer_tokens(accounts, instruction_data),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+/// Accounts expected:
+/// 0. `[signer]` Authority
+/// 1. `[writable]` Vault PDA
+/// 2. `[]` Vault token account
+/// 3. `[]` System program
+fn initialize(accounts: &[AccountView], instruction_data: &[u8]) -> ProgramResult {
+    let [authority_info, vault_info, vault_token_account_info, _system_program] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let bump = *instruction_data.get(1).ok_or(ProgramError::InvalidInstructionData)?;
+
+    let mut vault_data = vault_info.try_borrow_mut()?;
+
+    if vault_data.len() < Vault::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    let vault = Vault {
+        authority: authority_info.address().clone(),
+        token_account: vault_token_account_info.address().clone(),
+        bump,
+    };
+
+    vault.to_bytes(&mut vault_data).map_err(|_| ProgramError::AccountDataTooSmall)?;
+
+    Ok(())
+}
+
+/// SECURE: token_program at index 4 is validated before the CPI.
+///
+/// Accounts expected:
+/// 0. `[signer]` Authority
+/// 1. `[]` Vault PDA
+/// 2. `[writable]` Source token account
+/// 3. `[writable]` Destination token account
+/// 4. `[]` Token program (VALIDATED)
+fn transfer_tokens(accounts: &[AccountView], instruction_data: &[u8]) -> ProgramResult {
+    let [authority_info, vault_info, source_info, destination_info, token_program_info] = accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let vault_data = vault_info.try_borrow()?;
+    let vault = Vault::from_bytes(&vault_data).map_err(|_| ProgramError::InvalidAccountData)?;
+
+    if authority_info.address() != &vault.authority {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if source_info.address() != &vault.token_account {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let amount_bytes: [u8; 8] = instruction_data
+        .get(1..9)
+        .ok_or(ProgramError::InvalidInstructionData)?
+        .try_into()
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+    let amount = u64::from_le_bytes(amount_bytes);
+
+    // FIX: Validate the token program ID before the CPI
+    if token_program_info.address() != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    use pinocchio_token::instructions::Transfer;
+    Transfer {
+        from: source_info,
+        to: destination_info,
+        authority: authority_info,
+        amount,
+    }
+    .invoke()?;
+
+    Ok(())
+}
+```
+
+The fix is three lines inserted before the CPI:
+
+```rust
+if token_program_info.address() != &SPL_TOKEN_PROGRAM_ID {
+    return Err(ProgramError::IncorrectProgramId);
+}
+```
+
+If the caller passes any program other than the real SPL Token program, the transaction fails before the CPI ever fires.
+
+## Side-by-side comparison
+
+<Tabs>
+  <Tab title="Anchor">
+    **Vulnerable** -- accepts any program:
+    ```rust
+    /// CHECK: This account is NOT checked -- that is the vulnerability.
+    pub token_program: UncheckedAccount<'info>,
+    ```
+
+    **Secure** -- enforces `spl_token::ID`:
+    ```rust
+    pub token_program: Program<'info, Token>,
+    ```
+
+    Anchor's `Program<'info, T>` type performs the program ID assertion at deserialization time. A single type annotation change eliminates the vulnerability.
+  </Tab>
+
+  <Tab title="Pinocchio">
+    **Vulnerable** -- no check before CPI:
+    ```rust
+    use pinocchio_token::instructions::Transfer;
+    Transfer {
+        from: source_info,
+        to: destination_info,
+        authority: authority_info,
+        amount,
+    }
+    .invoke()?;
+    ```
+
+    **Secure** -- explicit program ID check:
+    ```rust
+    if token_program_info.address() != &SPL_TOKEN_PROGRAM_ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    use pinocchio_token::instructions::Transfer;
+    Transfer {
+        from: source_info,
+        to: destination_info,
+        authority: authority_info,
+        amount,
+    }
+    .invoke()?;
+    ```
+
+    Pinocchio provides no built-in type-level guard. We must compare the address against a hardcoded constant before every CPI.
+  </Tab>
+</Tabs>
+
+## Key takeaways
+
+- **Always validate the program ID before performing a CPI.** An unvalidated CPI target lets attackers run arbitrary code under your program's authority.
+- **In Anchor, use `Program<'info, T>` for every CPI target.** Never use `UncheckedAccount` for a program you intend to invoke.
+- **In Pinocchio, compare the account address against a hardcoded constant** before every CPI call. There is no type system to do it for you.
+- **Validating other accounts is not enough.** The vulnerable program correctly validates the signer, the vault PDA, and the source token account -- none of that matters if the program executing the transfer is malicious.
+- **This applies to any CPI target, not just SPL Token.** Oracles, governance programs, bridge programs -- any unvalidated CPI target can be substituted.
+
+## Run it yourself
+
+```bash
+# Clone the repository
+git clone https://github.com/danielAsaboro/solana_badger.git
+cd solana_badger
+npm install
+```
+
+You will see standard npm output as dependencies install.
+
+```bash
+# Run the Anchor tests (vulnerable + secure)
+anchor test -- --grep "Arbitrary CPI"
+```
+
+You will see two test groups: the vulnerable program accepting an arbitrary program ID (but failing at the CPI level since no real malicious program is deployed), and the secure program rejecting the attack outright during account deserialization.
+
+```bash
+# Run the Pinocchio tests
+npx jest tests/pinocchio/arbitrary-cpi.pinocchio.test.ts
+```
+
+You will see the same pattern: the vulnerable Pinocchio program accepts the substituted program ID, while the secure version returns `IncorrectProgramId` before the CPI fires.

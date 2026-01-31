@@ -1,490 +1,541 @@
 ---
 title: "Anchor vs Pinocchio"
-description: "Comprehensive comparison of security approaches in Anchor and Pinocchio frameworks"
+description: "Side-by-side comparison of how Anchor and Pinocchio handle the same six Solana vulnerabilities, grounded in real code from this repository"
 icon: "scale-balanced"
 ---
 
-# Anchor vs Pinocchio: Security Comparison
+Both Anchor and Pinocchio produce Solana programs. The difference is who is responsible for security checks: Anchor encodes them into its type system and constraint macros, while Pinocchio leaves every validation to the developer. This page compares the two frameworks side by side using the secure implementations from our repository.
 
-A detailed analysis of how the two major Solana development frameworks handle security, with real code examples from our vulnerability demonstrations.
+## Signer validation
 
-## Overview
-
-<CardGroup cols={2}>
-  <Card title="Anchor" icon="anchor">
-    **Type-safe, macro-driven framework**
-
-    Automatic security checks via type system
-  </Card>
-  <Card title="Pinocchio" icon="bolt">
-    **Zero-copy, performance-first framework**
-
-    Manual validation, maximum control
-  </Card>
-</CardGroup>
-
-## Core Philosophy
-
-<Tabs>
-  <Tab title="Anchor">
-    ### Safety Through Abstraction
-
-    Anchor prioritizes **developer experience** and **security by default**:
-
-    - Uses Rust's type system to enforce security checks
-    - Macros generate validation code automatically
-    - Constraintbased programming reduces boilerplate
-    - Compiler errors guide you to secure patterns
-
-    **Trade-off:** Slight overhead in binary size and runtime performance for significantly improved safety.
-  </Tab>
-
-  <Tab title="Pinocchio">
-    ### Performance Through Control
-
-    Pinocchio prioritizes **performance** and **minimal overhead**:
-
-    - Zero-copy account access
-    - Direct memory manipulation
-    - No macro overhead
-    - Minimal runtime abstraction
-
-    **Trade-off:** Developer must manually implement all security checks. Easy to miss critical validations.
-  </Tab>
-</Tabs>
-
-## Security Feature Comparison
-
-| Security Feature | Anchor | Pinocchio | Winner |
-|-----------------|--------|-----------|---------|
-| **Signer Validation** | `Signer<'info>` type | Manual `is_signer()` check | Anchor ⭐ |
-| **Owner Validation** | `Account<T>` type | Manual owner comparison | Anchor ⭐ |
-| **Program Validation** | `Program<'info, T>` | Manual program ID check | Anchor ⭐ |
-| **Discriminator Checks** | Automatic | Manual | Anchor ⭐ |
-| **Initialization Protection** | `init` constraint | Manual flag check | Anchor ⭐ |
-| **Binary Size** | ~250 KB | ~80 KB | Pinocchio ⭐ |
-| **Runtime Performance** | Good | Excellent | Pinocchio ⭐ |
-| **Compute Units** | Moderate | Minimal | Pinocchio ⭐ |
-
-## Code Comparison: Signer Checks
+A signer check confirms that the account actually signed the transaction. Without it, anyone who knows a public key can impersonate the owner.
 
 <CodeGroup>
-```rust Anchor - Vulnerable
-#[derive(Accounts)]
-pub struct UpdateOwnership<'info> {
-    // VULNERABILITY: UncheckedAccount doesn't validate signature
-    /// CHECK: INTENTIONALLY VULNERABLE
-    pub owner: UncheckedAccount<'info>,
-
-    #[account(mut, has_one = owner)]
-    pub program_account: Account<'info, ProgramAccount>,
-}
-```
-
-```rust Anchor - Secure
-#[derive(Accounts)]
-pub struct UpdateOwnership<'info> {
-    // FIX: Signer type enforces signature validation
-    pub owner: Signer<'info>,
-
-    #[account(mut, has_one = owner)]
-    pub program_account: Account<'info, ProgramAccount>,
-}
-```
-
-```rust Pinocchio - Vulnerable
-fn update_owner(accounts: &[AccountInfo]) -> ProgramResult {
-    let [owner_info, program_account_info, _] = accounts else {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    };
-
-    // VULNERABILITY: Missing is_signer() check
-    // Proceeds without validating signature
-
-    // Update owner
-    data[1..33].copy_from_slice(new_owner_info.key().as_ref());
+```rust Anchor
+pub fn update_owner(ctx: Context<UpdateOwnership>) -> Result<()> {
+    let program_account = &mut ctx.accounts.program_account;
+    program_account.owner = ctx.accounts.new_owner.key();
     Ok(())
 }
+
+#[derive(Accounts)]
+pub struct UpdateOwnership<'info> {
+    // Signer<'info> enforces signature validation automatically
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        has_one = owner,
+        seeds = [b"program-account", owner.key().as_ref()],
+        bump
+    )]
+    pub program_account: Account<'info, ProgramAccount>,
+
+    /// CHECK: New owner being set, no validation needed
+    pub new_owner: UncheckedAccount<'info>,
+}
 ```
 
-```rust Pinocchio - Secure
-fn update_owner(accounts: &[AccountInfo]) -> ProgramResult {
-    let [owner_info, program_account_info, _] = accounts else {
+```rust Pinocchio
+fn update_owner(accounts: &[AccountView]) -> ProgramResult {
+    let [owner_info, program_account_info, new_owner_info] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // FIX: Explicit is_signer() check
+    // Manual signer check
     if !owner_info.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Update owner
-    data[1..33].copy_from_slice(new_owner_info.key().as_ref());
+    // Manual owner check
+    if !program_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let mut data = program_account_info.try_borrow_mut()?;
+
+    if data[0] != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let stored_owner = Address::new_from_array(
+        <[u8; 32]>::try_from(&data[1..33]).unwrap(),
+    );
+    if stored_owner != *owner_info.address() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    data[1..33].copy_from_slice(new_owner_info.address().as_ref());
     Ok(())
 }
 ```
 </CodeGroup>
 
-<Info>
-**Key Difference:** Anchor's `Signer` type makes it impossible to forget signature validation. Pinocchio requires you to remember every check manually.
-</Info>
+Anchor's `Signer<'info>` type makes the signature check implicit -- if the account is not a signer, the transaction fails before the instruction body runs. In Pinocchio, we write the `is_signer()` guard ourselves and pair it with an explicit owner-match against stored data.
 
-## Code Comparison: Owner Checks
+## Owner validation
+
+An owner check confirms that the account is actually owned by our program. Without it, an attacker can pass a lookalike account controlled by a different program.
 
 <CodeGroup>
-```rust Anchor - Secure
+```rust Anchor
+pub fn update_data(ctx: Context<UpdateData>, new_data: u64) -> Result<()> {
+    let program_account = &ctx.accounts.program_account;
+    msg!("Current data: {}", program_account.data);
+    Ok(())
+}
+
 #[derive(Accounts)]
-pub struct UpdateAccount<'info> {
+pub struct UpdateData<'info> {
     pub authority: Signer<'info>,
 
-    // Account<T> automatically validates:
-    // 1. Account is owned by the program
-    // 2. Account discriminator matches T
-    // 3. Account data deserializes to T
-    #[account(mut, has_one = authority)]
+    // Account<'info, T> automatically validates:
+    //   1. Account is owned by this program
+    //   2. Discriminator matches ProgramAccount
+    //   3. Data deserializes correctly
+    #[account(mut)]
     pub program_account: Account<'info, ProgramAccount>,
 }
 ```
 
-```rust Pinocchio - Secure
-fn update_account(accounts: &[AccountInfo]) -> ProgramResult {
+```rust Pinocchio
+fn update_data(accounts: &[AccountView], instruction_data: &[u8]) -> ProgramResult {
     let [authority_info, program_account_info] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // Manual checks required:
-    // 1. Validate signer
     if !authority_info.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // 2. Validate owner
-    if program_account_info.owner() != &ID {
+    // Manual owner check -- must happen before reading data
+    if !program_account_info.owned_by(&ID) {
         return Err(ProgramError::InvalidAccountOwner);
     }
 
-    // 3. Validate discriminator (if using)
-    let data = program_account_info.try_borrow_data()?;
-    if data[0] != ACCOUNT_DISCRIMINATOR {
+    let account_data = program_account_info.try_borrow()?;
+
+    if account_data.len() < ProgramAccount::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    if account_data[0] != 1 {
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    let stored_authority = Address::new_from_array(
+        <[u8; 32]>::try_from(&account_data[9..41]).unwrap(),
+    );
+
+    // ... business logic using validated data
+    Ok(())
+}
+```
+</CodeGroup>
+
+Anchor's `Account<'info, T>` type bundles three checks into one: program ownership, discriminator match, and successful deserialization. In Pinocchio, each of those checks is a separate conditional that the developer must remember to include before touching account data.
+
+## Type cosplay
+
+Type cosplay occurs when an account of one type (e.g., `User`) is passed where another type (e.g., `Admin`) is expected. The fix requires verifying a discriminator that distinguishes account types.
+
+<CodeGroup>
+```rust Anchor
+pub fn admin_operation(ctx: Context<AdminOperation>) -> Result<()> {
+    let admin = &mut ctx.accounts.admin_account;
+    admin.operation_count += 1;
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct AdminOperation<'info> {
+    pub authority: Signer<'info>,
+
+    // Account<'info, Admin> checks the discriminator automatically.
+    // A User account has a different discriminator and will be rejected.
+    #[account(
+        mut,
+        constraint = admin_account.authority == authority.key()
+            @ ErrorCode::Unauthorized
+    )]
+    pub admin_account: Account<'info, Admin>,
+}
+```
+
+```rust Pinocchio
+fn admin_operation(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, admin_account_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !admin_account_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let data = admin_account_info.try_borrow()?;
+
+    if data.len() < Admin::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+
+    // Manual discriminator check -- this is the line that prevents cosplay
+    if data[0] != Admin::DISCRIMINATOR {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // 4. Validate authority matches
-    let stored_authority = Pubkey::from(/* ... */);
-    if stored_authority != *authority_info.key() {
+    let admin = Admin::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    let authority_bytes: [u8; 32] =
+        authority_info.address().as_ref().try_into().unwrap();
+    if admin.authority != authority_bytes {
         return Err(ProgramError::InvalidAccountData);
     }
+
+    // Update operation count
+    drop(data);
+    let mut data = admin_account_info.try_borrow_mut()?;
+    let admin = Admin::deserialize(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let new_count = admin.operation_count + 1;
+    data[34..42].copy_from_slice(&new_count.to_le_bytes());
 
     Ok(())
 }
 ```
 </CodeGroup>
 
-<Warning>
-Pinocchio requires **4 manual checks** for what Anchor does automatically with one type. Missing any check creates a vulnerability.
-</Warning>
+Anchor derives an 8-byte discriminator from the type name at compile time and checks it during deserialization. In Pinocchio, we define our own discriminator byte and validate it explicitly before trusting the account's contents.
 
-## Code Comparison: Arbitrary CPI
+## Arbitrary CPI
+
+An arbitrary CPI attack tricks a program into invoking a malicious program instead of the intended one (e.g., a fake Token program). The fix is validating the program ID before the cross-program invocation.
 
 <CodeGroup>
-```rust Anchor - Secure
-#[derive(Accounts)]
-pub struct TransferTokens<'info> {
-    #[account(mut)]
-    pub vault: Account<'info, TokenAccount>,
-
-    // Program<'info, Token> validates the program ID
-    // Ensures only the real Token program can be called
-    pub token_program: Program<'info, Token>,
+```rust Anchor
+pub fn transfer_tokens(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
+    let cpi_accounts = Transfer {
+        from: ctx.accounts.source.to_account_info(),
+        to: ctx.accounts.destination.to_account_info(),
+        authority: ctx.accounts.authority.to_account_info(),
+    };
+    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+    token::transfer(cpi_ctx, amount)?;
+    Ok(())
 }
 
-pub fn transfer(ctx: Context<TransferTokens>, amount: u64) -> Result<()> {
-    // Safe: token_program is validated to be the real Token program
-    token::transfer(
-        CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            Transfer { /* ... */ },
-        ),
-        amount,
-    )
+#[derive(Accounts)]
+pub struct TransferTokens<'info> {
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"vault", authority.key().as_ref()],
+        bump = vault.bump,
+        constraint = vault.authority == authority.key()
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut, constraint = source.key() == vault.token_account)]
+    pub source: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub destination: Account<'info, TokenAccount>,
+
+    // Program<'info, Token> validates token_program.key() == spl_token::ID
+    pub token_program: Program<'info, Token>,
 }
 ```
 
-```rust Pinocchio - Secure
-fn transfer_tokens(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
-    let [vault_info, token_program_info] = accounts else {
+```rust Pinocchio
+fn transfer_tokens(accounts: &[AccountView], instruction_data: &[u8]) -> ProgramResult {
+    let [authority_info, vault_info, source_info, destination_info, token_program_info] =
+        accounts
+    else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    // MUST manually validate the program ID
-    if token_program_info.key() != &spl_token::ID {
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+
+    let vault_data = vault_info.try_borrow()?;
+    let vault = Vault::from_bytes(&vault_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    if authority_info.address() != &vault.authority {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if source_info.address() != &vault.token_account {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // Manual program ID check -- prevents calling a malicious program
+    if token_program_info.address() != &SPL_TOKEN_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // Now safe to invoke
-    invoke(
-        &token_instruction::transfer(/* ... */)?,
-        &[vault_info, token_program_info],
-    )
+    Transfer {
+        from: source_info,
+        to: destination_info,
+        authority: authority_info,
+        amount: u64::from_le_bytes(
+            instruction_data[1..9].try_into().unwrap()
+        ),
+    }
+    .invoke()?;
+
+    Ok(())
 }
 ```
 </CodeGroup>
 
-## Development Experience
+Anchor's `Program<'info, Token>` type verifies the program key matches the SPL Token program ID before the instruction runs. In Pinocchio, we compare `token_program_info.address()` against a hard-coded constant ourselves.
 
-### Anchor: Guided by Types
+## PDA sharing
 
-```mermaid
-graph TD
-    A[Write Code] --> B{Compile}
-    B -->|Type Error| C[Fix Type]
-    C --> B
-    B -->|Success| D[Secure by Default]
+PDA sharing happens when multiple users share the same PDA for a vault, allowing one user to withdraw another's funds. The fix derives the PDA from user-specific seeds and validates ownership on withdrawal.
 
-    style D fill:#16A34A
+<CodeGroup>
+```rust Anchor
+pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    let seeds = &[
+        b"pool",
+        ctx.accounts.pool.owner.as_ref(),
+        ctx.accounts.pool.mint.as_ref(),
+        &[ctx.accounts.pool.bump],
+    ];
+    let signer = &[&seeds[..]];
+
+    let cpi_accounts = Transfer {
+        from: ctx.accounts.vault.to_account_info(),
+        to: ctx.accounts.destination.to_account_info(),
+        authority: ctx.accounts.pool.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.token_program.to_account_info(),
+        cpi_accounts,
+        signer,
+    );
+    token::transfer(cpi_ctx, amount)?;
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    pub owner: Signer<'info>,
+
+    // PDA derived from owner + mint -- unique per user
+    // has_one = owner ensures only the pool owner can withdraw
+    #[account(
+        seeds = [b"pool", pool.owner.as_ref(), pool.mint.as_ref()],
+        bump = pool.bump,
+        has_one = owner @ ErrorCode::UnauthorizedWithdrawal
+    )]
+    pub pool: Account<'info, TokenPool>,
+
+    #[account(
+        mut,
+        constraint = vault.key() == pool.vault @ ErrorCode::InvalidVault
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = destination.mint == pool.mint
+            @ ErrorCode::InvalidDestinationMint
+    )]
+    pub destination: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
 ```
 
-<Accordion title="Anchor Developer Experience">
-  **Pros:**
-  - Type system catches security issues at compile time
-  - Clear error messages guide you to fixes
-  - Constraints handle common patterns automatically
-  - Less code to write and maintain
-  - Easier onboarding for new developers
+```rust Pinocchio
+fn withdraw(accounts: &[AccountView], amount: u64) -> ProgramResult {
+    let [owner_info, pool_info, vault_info, destination_info, _token_program] =
+        accounts
+    else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-  **Cons:**
-  - Macro compilation can be slow
-  - Less control over generated code
-  - Slightly larger binaries
-  - Learning curve for macro system
-</Accordion>
+    if !owner_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
-### Pinocchio: Freedom and Responsibility
+    let pool_data = pool_info.try_borrow()?;
+    let pool = TokenPool::deserialize(&pool_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
 
-```mermaid
-graph TD
-    A[Write Code] --> B{Compile}
-    B -->|Syntax OK| C{Runtime Check}
-    C -->|Missing Validation| D[Vulnerability!]
-    C -->|All Checks| E[Secure]
+    // Verify PDA derivation includes the owner
+    let (expected_pool, bump) = find_pda(
+        &[b"pool", pool.owner.as_ref(), pool.mint.as_ref()],
+        ID.as_ref(),
+    );
+    if pool_info.address().as_ref() != expected_pool.as_ref() {
+        return Err(ProgramError::InvalidSeeds);
+    }
 
-    style D fill:#EF4444
-    style E fill:#16A34A
+    // Verify signer matches pool owner
+    if owner_info.address().as_ref() != pool.owner.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // Verify vault matches pool
+    if vault_info.address().as_ref() != pool.vault.as_ref() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let bump_seed = [bump];
+    let seeds = [
+        pinocchio::cpi::Seed::from(&b"pool"[..]),
+        pinocchio::cpi::Seed::from(pool.owner.as_ref()),
+        pinocchio::cpi::Seed::from(pool.mint.as_ref()),
+        pinocchio::cpi::Seed::from(&bump_seed[..]),
+    ];
+    let signer = pinocchio::cpi::Signer::from(&seeds[..]);
+
+    Transfer {
+        from: vault_info,
+        to: destination_info,
+        authority: pool_info,
+        amount,
+    }
+    .invoke_signed(&[signer])?;
+
+    Ok(())
+}
+```
+</CodeGroup>
+
+Anchor's `seeds` and `has_one` constraints declare the PDA derivation and ownership check in the account struct. Pinocchio requires us to re-derive the PDA manually, compare it against the supplied account, and verify the signer matches the stored owner -- three separate steps that Anchor collapses into two constraint attributes.
+
+## Reinitialization
+
+A reinitialization attack overwrites an already-initialized account, potentially replacing the authority. The fix ensures an account can only be initialized once.
+
+<CodeGroup>
+```rust Anchor
+pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+    vault.authority = ctx.accounts.authority.key();
+    vault.balance = 0;
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    // `init` constraint:
+    //   1. Checks discriminator is zero (not yet initialized)
+    //   2. Creates the account with correct size
+    //   3. Sets discriminator to prevent future reinitialization
+    //   4. Handles rent payment
+    #[account(
+        init,
+        payer = authority,
+        space = Vault::LEN
+    )]
+    pub vault: Account<'info, Vault>,
+
+    pub system_program: Program<'info, System>,
+}
 ```
 
-<Accordion title="Pinocchio Developer Experience">
-  **Pros:**
-  - Complete control over every operation
-  - Zero-copy memory access
-  - Smallest possible binaries
-  - Fastest runtime performance
-  - No macro overhead
+```rust Pinocchio
+fn initialize(accounts: &[AccountView]) -> ProgramResult {
+    let [authority_info, vault_info] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
 
-  **Cons:**
-  - Must remember every security check
-  - Easy to introduce vulnerabilities
-  - More boilerplate code
-  - Steeper learning curve
-  - Requires deep Solana knowledge
-</Accordion>
+    if !authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
-## Performance Benchmarks
+    if !vault_info.owned_by(&ID) {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
 
-<Tabs>
-  <Tab title="Binary Size">
-    Compiled program sizes for the same logic:
+    let mut data = vault_info.try_borrow_mut()?;
 
-    | Program | Anchor | Pinocchio | Difference |
-    |---------|--------|-----------|------------|
-    | Signer Checks | 248 KB | 82 KB | **-67%** |
-    | Owner Checks | 252 KB | 79 KB | **-69%** |
-    | Arbitrary CPI | 276 KB | 91 KB | **-67%** |
-    | Type Cosplay | 265 KB | 86 KB | **-68%** |
+    if data.len() < Vault::LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
 
-    <Note>
-    Pinocchio programs are consistently **~70% smaller** due to zero-copy design and lack of macro overhead.
-    </Note>
-  </Tab>
+    // Manual discriminator check -- rejects already-initialized accounts
+    if data[0] == Vault::DISCRIMINATOR {
+        return Err(ProgramError::AccountAlreadyInitialized);
+    }
 
-  <Tab title="Compute Units">
-    Approximate compute unit (CU) usage:
+    data[0] = Vault::DISCRIMINATOR;
+    data[1..33].copy_from_slice(authority_info.address().as_ref());
+    data[33..41].fill(0);
 
-    | Operation | Anchor | Pinocchio | Difference |
-    |-----------|--------|-----------|------------|
-    | Account Validation | 2,500 CU | 800 CU | **-68%** |
-    | Data Deserialization | 3,200 CU | 200 CU | **-94%** |
-    | CPI Call Setup | 1,800 CU | 600 CU | **-67%** |
-
-    <Warning>
-    For high-frequency operations or complex transactions, compute unit savings can make the difference between success and failure.
-    </Warning>
-  </Tab>
-
-  <Tab title="Memory Usage">
-    Stack memory consumption:
-
-    | Framework | Average Stack Usage | Peak Stack Usage |
-    |-----------|---------------------|------------------|
-    | Anchor | 12-18 KB | 24 KB |
-    | Pinocchio | 4-6 KB | 8 KB |
-
-    <Tip>
-    Pinocchio's zero-copy design means accounts are read directly from transaction buffers without deserialization overhead.
-    </Tip>
-  </Tab>
-</Tabs>
-
-## When to Use Each Framework
-
-```mermaid
-%%{init: {'theme':'dark'}}%%
-quadrantChart
-    title Security vs Performance Tradeoff
-    x-axis Low Security --> High Security
-    y-axis Low Performance --> High Performance
-    quadrant-1 Ideal (Use Pinocchio + Manual Checks)
-    quadrant-2 Over-Engineered
-    quadrant-3 Dangerous (Avoid)
-    quadrant-4 Safe but Slow
-
-    Anchor: [0.85, 0.65]
-    Pinocchio Secure: [0.75, 0.95]
-    Pinocchio Vulnerable: [0.25, 0.95]
-    Native Rust: [0.70, 0.98]
+    Ok(())
+}
 ```
+</CodeGroup>
 
-### Use Anchor When:
+Anchor's `init` constraint handles account creation, discriminator setting, and reinitialization prevention in one declaration. In Pinocchio, we manually check whether the discriminator byte is already set, and only proceed if the account is fresh.
 
-<CardGroup cols={2}>
-  <Card title="Starting Out" icon="seedling">
-    Learning Solana development? Anchor's guardrails prevent common mistakes.
-  </Card>
-  <Card title="DeFi Applications" icon="coins">
-    Handling user funds? Anchor's automatic checks reduce risk.
-  </Card>
-  <Card title="Team Projects" icon="users">
-    Multiple developers? Anchor's type system catches errors during code review.
-  </Card>
-  <Card title="Rapid Prototyping" icon="rocket">
-    Building quickly? Anchor's constraints reduce boilerplate.
-  </Card>
-</CardGroup>
+## Lines of validation code
 
-### Use Pinocchio When:
+The table below counts the lines dedicated purely to security validation (signer checks, owner checks, discriminator checks, PDA derivation, constraint enforcement) in each secure implementation, excluding business logic and serialization.
 
-<CardGroup cols={2}>
-  <Card title="Performance Critical" icon="gauge-high">
-    Every compute unit matters? Pinocchio's zero-copy design delivers maximum performance.
-  </Card>
-  <Card title="Size Constrained" icon="compress">
-    Program size limits an issue? Pinocchio produces the smallest binaries.
-  </Card>
-  <Card title="Expert Developers" icon="user-ninja">
-    Team has deep Solana expertise? Leverage maximum control.
-  </Card>
-  <Card title="Native Programs" icon="microchip">
-    Building core infrastructure? Pinocchio mirrors native program patterns.
-  </Card>
-</CardGroup>
+| Vulnerability | Anchor | Pinocchio |
+|---|---|---|
+| Signer validation | 2 | 6 |
+| Owner validation | 1 | 4 |
+| Type cosplay | 2 | 6 |
+| Arbitrary CPI | 2 | 6 |
+| PDA sharing | 3 | 8 |
+| Reinitialization | 1 | 3 |
+| **Total** | **11** | **33** |
 
-## Migration Strategy
+Anchor programs average roughly one-third the validation code of their Pinocchio equivalents. The gap reflects work that Anchor's macros generate at compile time, which Pinocchio developers must write and maintain by hand.
 
-<Steps>
-  <Step title="Start with Anchor">
-    Build your initial implementation in Anchor to get the logic right with built-in security.
-  </Step>
+## Performance comparison
 
-  <Step title="Profile Performance">
-    Measure compute units, binary size, and identify bottlenecks.
-  </Step>
+### Binary size
 
-  <Step title="Selective Optimization">
-    Rewrite only performance-critical paths in Pinocchio while keeping the rest in Anchor.
-  </Step>
+Compiled program sizes for equivalent logic:
 
-  <Step title="Maintain Security">
-    For Pinocchio code, create a security checklist based on Anchor's automatic checks.
-  </Step>
-</Steps>
+| Program | Anchor | Pinocchio | Reduction |
+|---|---|---|---|
+| Signer Checks | 248 KB | 82 KB | 67% |
+| Owner Checks | 252 KB | 79 KB | 69% |
+| Arbitrary CPI | 276 KB | 91 KB | 67% |
+| Type Cosplay | 265 KB | 86 KB | 68% |
 
-## Security Checklist
+### Compute units
 
-### Anchor Review Checklist
+Approximate compute unit usage:
 
-- [ ] All authority accounts use `Signer<'info>`
-- [ ] All program accounts use `Account<'info, T>`
-- [ ] CPI targets use `Program<'info, T>`
-- [ ] Initialization uses `init` constraint
-- [ ] Close operations use `close` constraint
-- [ ] All constraints are tested
+| Operation | Anchor | Pinocchio | Reduction |
+|---|---|---|---|
+| Account validation | 2,500 CU | 800 CU | 68% |
+| Data deserialization | 3,200 CU | 200 CU | 94% |
+| CPI call setup | 1,800 CU | 600 CU | 67% |
 
-### Pinocchio Review Checklist
+Pinocchio's zero-copy design reads accounts directly from transaction buffers without deserialization overhead, which accounts for most of the compute unit savings.
 
-- [ ] All signers validated with `is_signer()`
-- [ ] All accounts validated with `owner()` check
-- [ ] All CPI targets validated with program ID check
-- [ ] Discriminators checked for account types
-- [ ] Initialization flags checked
-- [ ] All validations happen BEFORE state changes
-- [ ] Test suite includes exploit attempts
+## When to use each
 
-## Real-World Examples
+**Use Anchor when** the program handles user funds, the team includes developers who are newer to Solana, or development speed matters more than squeezing out the last compute unit. Anchor's type system catches missing checks at compile time, and the constraint macros eliminate entire categories of bugs. For the vast majority of programs -- DeFi protocols, NFT marketplaces, governance systems -- Anchor's overhead is negligible relative to the security it provides by default.
 
-<AccordionGroup>
-  <Accordion title="Anchor Success Story: Marinade Finance">
-    Marinade Finance uses Anchor for their liquid staking protocol, managing **$300M+ TVL**. The type safety and automatic checks have prevented multiple potential exploits caught during audits.
+**Use Pinocchio when** every compute unit counts, binary size is constrained, and the team has deep Solana expertise with a thorough review and testing process. Pinocchio is well suited for core infrastructure, high-frequency operations, and programs that push up against transaction compute limits. The trade-off is real: as this repository demonstrates, Pinocchio requires roughly three times the validation code, and forgetting a single check opens a vulnerability that Anchor would have prevented automatically.
 
-    **Why Anchor:** Managing user funds requires maximum security. The team prioritized safety over marginal performance gains.
-  </Accordion>
-
-  <Accordion title="Pinocchio Success Story: Token Program">
-    Solana's native Token program (SPL Token) uses patterns similar to Pinocchio's zero-copy approach. It processes **millions of transfers daily** with minimal compute unit usage.
-
-    **Why Native/Pinocchio:** Core infrastructure requires maximum performance. Expert developers can maintain security through rigorous reviews and testing.
-  </Accordion>
-</AccordionGroup>
-
-## Conclusion
-
-<Tabs>
-  <Tab title="For Most Projects">
-    ### Choose Anchor
-
-    Unless you have specific performance requirements or expert-level developers, **Anchor is the right choice**:
-
-    - Security by default
-    - Faster development
-    - Easier maintenance
-    - Better for teams
-    - Sufficient performance for 95% of use cases
-  </Tab>
-
-  <Tab title="For High-Performance">
-    ### Choose Pinocchio Carefully
-
-    If you need maximum performance and have the expertise:
-
-    - Establish strict security review processes
-    - Create comprehensive test suites with exploit attempts
-    - Use this repository as a reference for secure patterns
-    - Consider hybrid approach (Anchor + Pinocchio hotspaths)
-  </Tab>
-</Tabs>
-
-<Warning>
-**Performance should NEVER come at the cost of security.** If choosing Pinocchio, ensure your team has the expertise to implement all security checks correctly.
-</Warning>
-
-## Further Reading
-
-<CardGroup cols={3}>
-  <Card title="Vulnerability Examples" icon="shield-halved" href="/vulnerabilities/signer-checks">
-    See real security issues in both frameworks
-  </Card>
-  <Card title="Security Tradeoffs" icon="scale-unbalanced" href="/comparisons/security-tradeoffs">
-    Deep dive into framework security models
-  </Card>
-  <Card title="Source Code" icon="github" href="https://github.com/superteamng/solana-security-reference">
-    Study the complete implementations
-  </Card>
-</CardGroup>
+<Note>
+The source code for every example on this page is available in the [repository](https://github.com/danielAsaboro/solana_badger). Each vulnerability has both a vulnerable and secure implementation for both frameworks.
+</Note>

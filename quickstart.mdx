@@ -76,8 +76,8 @@ Before you begin, ensure you have the following installed:
 <Steps>
   <Step title="Clone the Repository">
     ```bash
-    git clone https://github.com/superteamng/solana-security-reference
-    cd solana-security-reference
+    git clone https://github.com/danielAsaboro/solana_badger
+    cd solana_badger
     ```
   </Step>
 
@@ -253,22 +253,23 @@ Vulnerability: Missing Signer Checks
 ### Repository Structure
 
 ```
-solana-security-reference/
+solana_badger/
 ├── programs/                    # All Solana programs
 │   ├── signer-checks/
 │   │   ├── vulnerable/
 │   │   │   ├── anchor/          # Vulnerable Anchor implementation
 │   │   │   └── pinocchio/       # Vulnerable Pinocchio implementation
-│   │   ├── secure/
-│   │   │   ├── anchor/          # Secure Anchor implementation
-│   │   │   └── pinocchio/       # Secure Pinocchio implementation
-│   │   └── README.md            # Vulnerability-specific docs
+│   │   └── secure/
+│   │       ├── anchor/          # Secure Anchor implementation
+│   │       └── pinocchio/       # Secure Pinocchio implementation
 │   ├── owner-checks/
 │   ├── arbitrary-cpi/
 │   ├── reinitialization-attacks/
 │   ├── type-cosplay/
 │   └── pda-sharing/
-├── tests/                       # Test suites
+├── tests/                       # Anchor test suites
+│   └── pinocchio/               # Pinocchio test suites
+├── exploits/                    # Standalone exploit scripts
 ├── scripts/                     # Build scripts
 └── badger/docs/                 # This documentation
 ```
@@ -390,7 +391,7 @@ solana-security-reference/
 ## Getting Help
 
 <CardGroup cols={3}>
-  <Card title="GitHub Issues" icon="github" href="https://github.com/superteamng/solana-security-reference/issues">
+  <Card title="GitHub Issues" icon="github" href="https://github.com/danielAsaboro/solana_badger/issues">
     Report bugs or ask questions
   </Card>
   <Card title="SuperteamNG" icon="users" href="https://superteam.fun/ng">

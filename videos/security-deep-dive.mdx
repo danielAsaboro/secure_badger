@@ -1,451 +1,79 @@
 ---
 title: "Video Deep Dive"
-description: "Comprehensive video walkthroughs of Solana security vulnerabilities"
+description: "Video walkthroughs of Solana security vulnerabilities"
 icon: "video"
 ---
 
-# Security Deep Dive - Video Series
-
-<Info>
-**Video Scripts Complete – Production Ready!** Comprehensive video scripts for all 6 vulnerabilities plus framework comparison are available in the `video scripts/` directory. Scripts include detailed narration, code examples, visual diagram descriptions, and step-by-step attack demonstrations. Video recording in progress.
-</Info>
-
-## Overview
-
-This video series provides hands-on demonstrations of each security vulnerability, showing:
-- **Live code walkthroughs** of vulnerable and secure implementations
-- **Real-time exploit demonstrations** proving vulnerabilities work
-- **Step-by-step fix implementations** with explanations
-- **Framework comparisons** (Anchor vs Pinocchio)
-- **Testing strategies** to verify security
-
-<CardGroup cols={3}>
-  <Card title="6 Vulnerabilities" icon="shield-halved">
-    Complete coverage of all critical Solana security issues
-  </Card>
-  <Card title="Live Coding" icon="code">
-    Watch exploits happen and fixes prevent them in real-time
-  </Card>
-  <Card title="Both Frameworks" icon="layer-group">
-    Side-by-side comparison of Anchor and Pinocchio approaches
-  </Card>
-</CardGroup>
-
-## Main Course
-
-### Complete Security Guide (25-30 minutes)
+# Security Deep Dive — Video Series
 
 <Note>
-**Status:** Script Complete – Ready for Recording
-**Script Location:** `video scripts/solana-security-deep-dive-main-course.md`
-**Format:** Screen recording with live coding and terminal output
-**Topics:** All 6 vulnerabilities with demonstrations
+**Video content is in production.** Comprehensive video scripts covering all 6 vulnerabilities and the framework comparison are complete. Recording is in progress.
 </Note>
 
-**What You'll Learn:**
-- Understanding Solana's account model and why these vulnerabilities exist
-- Live demonstration of 2-3 critical exploits
-- How to fix vulnerabilities using both Anchor and Pinocchio
+## Planned Topics
+
+Each video walks through the vulnerable code, demonstrates the exploit, and implements the fix in both Anchor and Pinocchio.
+
+| Video | Duration (est.) | Focus |
+|-------|----------------|-------|
+| Missing Signer Checks | 8 min | Unauthorized ownership transfer via missing signature validation |
+| Missing Owner Checks | 7 min | Fake account injection via missing program ownership validation |
+| Type Cosplay | 7 min | Privilege escalation via account type confusion |
+| Arbitrary CPI | 9 min | Authority hijacking via unvalidated cross-program invocations |
+| PDA Sharing | 6 min | Cross-user fund theft via insufficient PDA seed derivation |
+| Reinitialization Attacks | 8 min | Account takeover via missing initialization guards |
+| Anchor vs Pinocchio | 12 min | Side-by-side security comparison across all vulnerabilities |
+
+## Main Course (25-30 minutes)
+
+A single comprehensive video covering:
+
+- The Solana account model and why these vulnerabilities exist
+- Live demonstrations of 2-3 critical exploits
+- Fixes in both Anchor and Pinocchio
 - Security best practices checklist
 - When to use each framework
-
-**Video Chapters (Planned):**
-1. **Introduction** (0:00-3:00) - Solana security landscape overview
-2. **Missing Signer Checks** (3:00-10:00) - Live exploit demo
-3. **Missing Owner Checks** (10:00-17:00) - Fake account attacks
-4. **Framework Comparison** (17:00-22:00) - Anchor vs Pinocchio security
-5. **Best Practices** (22:00-25:00) - Security checklist and recommendations
-6. **Resources** (25:00-28:00) - Where to learn more
-
-<Accordion title="Recording Setup Details">
-  **Technical Specifications:**
-  - Resolution: 1920x1080 (Full HD)
-  - Screen Layout: 70% IDE (VS Code), 30% Terminal
-  - Recording Tool: OBS Studio or Loom
-  - Audio: Clear USB microphone
-  - Code Theme: Dark mode for readability
-
-  **Content Format:**
-  - Live code walkthrough (not slides)
-  - Real terminal output from test execution
-  - Syntax highlighting for code clarity
-  - On-screen annotations for key points
-</Accordion>
-
----
-
-## Individual Vulnerability Videos
-
-<Tabs>
-  <Tab title="Critical Severity">
-    ### Missing Signer Checks (8 minutes)
-
-    <Note>
-    **Status:** Planned
-    **Focus:** The #1 most common Solana vulnerability
-    </Note>
-
-    **Content Outline:**
-    - What are signer checks and why they matter
-    - Live demo: Attacker steals account ownership without signature
-    - Three ways to fix (Signer type, constraint, manual check)
-    - Testing strategy to verify the fix
-
-    <Accordion title="Code Examples Shown">
-      - Vulnerable Anchor implementation with `UncheckedAccount`
-      - Exploit test demonstrating unauthorized ownership transfer
-      - Secure Anchor implementation with `Signer<'info>`
-      - Secure Pinocchio implementation with `is_signer()` check
-      - Test verification showing exploit blocked
-    </Accordion>
-
-    ---
-
-    ### Missing Owner Checks (7 minutes)
-
-    <Note>
-    **Status:** Planned
-    **Focus:** Fake account attacks and why discriminators aren't enough
-    </Note>
-
-    **Content Outline:**
-    - Understanding Solana's account ownership model
-    - Live demo: Attacker creates fake account with malicious data
-    - Why discriminators don't protect against fake accounts
-    - Proper owner validation in both frameworks
-
-    <Accordion title="Key Concepts Explained">
-      - The difference between data validation and ownership validation
-      - How attackers can replicate discriminators
-      - Why `UncheckedAccount` is dangerous for data deserialization
-      - When `Account<'info, T>` saves you from this vulnerability
-    </Accordion>
-  </Tab>
-
-  <Tab title="High Severity">
-    ### Arbitrary CPI Attacks (9 minutes)
-
-    <Note>
-    **Status:** Planned
-    **Focus:** How unvalidated cross-program invocations enable authority hijacking
-    </Note>
-
-    **Content Outline:**
-    - Introduction to Cross-Program Invocations (CPIs)
-    - Live demo: Attacker deploys malicious "token program"
-    - How malicious programs inherit your authority
-    - Three approaches to secure CPI validation
-
-    <Accordion title="Demonstrations Included">
-      - Vulnerable vault program accepting any token program
-      - Malicious program reversing transfer logic
-      - Secure implementation with `Program<'info, Token>` type
-      - Pinocchio manual program ID validation
-      - Test showing fake program rejected
-    </Accordion>
-
-    ---
-
-    ### Reinitialization Attacks (8 minutes)
-
-    <Note>
-    **Status:** Planned
-    **Focus:** Account lifecycle vulnerabilities and authority takeover
-    </Note>
-
-    **Content Outline:**
-    - Understanding Solana account initialization
-    - Live demo: Attacker reinitializes victim's vault account
-    - Why missing initialization checks are devastating
-    - Proper use of Anchor's `init` constraint and manual flags
-
-    <Accordion title="Security Patterns Covered">
-      - Anchor's `init` constraint automatic protection
-      - Manual initialization flag validation
-      - Discriminator-based initialization detection
-      - When `init_if_needed` is safe vs dangerous
-    </Accordion>
-  </Tab>
-
-  <Tab title="Medium Severity">
-    ### Type Cosplay Attacks (7 minutes)
-
-    <Note>
-    **Status:** Planned
-    **Focus:** Account type confusion and privilege escalation
-    </Note>
-
-    **Content Outline:**
-    - Understanding account discriminators
-    - Live demo: User account masquerading as Admin account
-    - Why identical memory layouts enable type cosplay
-    - Discriminator validation in both frameworks
-
-    <Accordion title="Advanced Topics">
-      - How Anchor calculates discriminators (SHA256)
-      - When UncheckedAccount is safe vs unsafe
-      - Manual discriminator validation patterns
-      - Design patterns to prevent identical layouts
-    </Accordion>
-
-    ---
-
-    ### PDA Sharing Attacks (6 minutes)
-
-    <Note>
-    **Status:** Planned
-    **Focus:** Cross-user authority exploitation via insufficient PDA seeds
-    </Note>
-
-    **Content Outline:**
-    - Introduction to Program Derived Addresses (PDAs)
-    - Live demo: Attacker drains another user's pool
-    - Why global PDAs are dangerous for user funds
-    - User-specific PDA derivation patterns
-
-    <Accordion title="PDA Best Practices">
-      - The `[b"resource", user.key(), identifier.key()]` pattern
-      - When shared PDAs are acceptable (with proper accounting)
-      - How to audit PDA derivations for security
-      - Testing strategies for PDA isolation
-    </Accordion>
-  </Tab>
-
-  <Tab title="Framework Comparison">
-    ### Anchor vs Pinocchio: Security Deep Dive (12 minutes)
-
-    <Note>
-    **Status:** Planned
-    **Focus:** Comprehensive comparison of security approaches
-    </Note>
-
-    **Content Outline:**
-    - Side-by-side code comparison for each vulnerability
-    - Performance vs security trade-off analysis
-    - When to choose Anchor vs Pinocchio
-    - Real-world benchmarks and case studies
-
-    **Topics Covered:**
-    1. **Automatic vs Manual Validation** (3 min)
-       - Anchor's type system advantages
-       - Pinocchio's performance benefits
-       - The cost of manual checks
-
-    2. **Development Speed** (3 min)
-       - Code volume comparison
-       - Time to implement secure patterns
-       - Learning curve analysis
-
-    3. **Security by Default** (3 min)
-       - What Anchor prevents automatically
-       - Common Pinocchio mistakes
-       - Audit complexity differences
-
-    4. **Decision Framework** (3 min)
-       - When Anchor is the right choice
-       - When Pinocchio makes sense
-       - Hybrid approaches
-
-    <Accordion title="Benchmark Data Shown">
-      - Compute Unit usage comparison
-      - Program size comparison
-      - Development time estimates
-      - Security audit findings statistics
-      - Real protocol case studies
-    </Accordion>
-  </Tab>
-</Tabs>
-
-## How to Use These Videos
-
-<Steps>
-  <Step title="Start with the Main Course">
-    Watch the 25-30 minute complete guide to understand all vulnerabilities at a high level
-  </Step>
-  <Step title="Deep Dive Individual Topics">
-    For each vulnerability you want to master, watch the specific 6-9 minute focused video
-  </Step>
-  <Step title="Follow Along with Code">
-    Clone the repository and follow along with the live demonstrations
-  </Step>
-  <Step title="Run the Tests">
-    Execute the exploit tests yourself to see vulnerabilities in action
-  </Step>
-  <Step title="Implement Your Own Fixes">
-    Practice by trying to fix the vulnerabilities before watching the solutions
-  </Step>
-</Steps>
 
 ## Learning Path Recommendations
 
 <Tabs>
   <Tab title="Beginners">
-    ### New to Solana Security
-
-    **Recommended Order:**
-    1. Main Course video (complete overview)
+    1. Watch the Main Course video first (complete overview)
     2. Missing Signer Checks (most common vulnerability)
     3. Missing Owner Checks (second most common)
     4. Framework Comparison (understand tooling choices)
-    5. Other vulnerabilities as needed
-
-    **Supplementary Materials:**
-    - [Quickstart Guide](/quickstart) - Set up your development environment
-    - [Signer Checks Documentation](/vulnerabilities/signer-checks)
-    - [Owner Checks Documentation](/vulnerabilities/owner-checks)
+    5. Remaining vulnerabilities as needed
   </Tab>
 
   <Tab title="Intermediate">
-    ### Familiar with Solana Basics
-
-    **Recommended Order:**
-    1. Individual vulnerability videos for gaps in knowledge
+    1. Individual vulnerability videos for knowledge gaps
     2. Framework Comparison (optimize your tooling choice)
-    3. Main Course (comprehensive review)
-
-    **Focus Areas:**
-    - CPI security patterns
-    - PDA derivation best practices
-    - Testing exploit scenarios
+    3. Main Course as a comprehensive review
   </Tab>
 
   <Tab title="Advanced">
-    ### Experienced Developers
-
-    **Recommended Use:**
-    - Framework Comparison video for optimization insights
-    - Individual videos as reference material
-    - Use tests as templates for your own protocols
-
-    **Advanced Topics:**
-    - Hybrid Anchor/Pinocchio approaches
-    - Custom security constraint implementations
-    - Performance optimization without compromising security
+    1. Framework Comparison for optimization insights
+    2. Individual videos as reference material
+    3. Use the test suite as templates for your own protocols
   </Tab>
 </Tabs>
 
-## Additional Resources
+## In the Meantime
 
-<CardGroup cols={4}>
-  <Card title="Source Code" icon="github" href="https://github.com/superteamng/solana-security-reference">
-    Browse all 24 programs (vulnerable + secure)
-  </Card>
-  <Card title="Run Tests" icon="flask" href="https://github.com/superteamng/solana-security-reference/tree/main/tests">
-    Execute exploits and verify fixes locally
-  </Card>
-  <Card title="Documentation" icon="book" href="/vulnerabilities/signer-checks">
-    Read detailed written guides for each vulnerability
-  </Card>
-  <Card title="Comparisons" icon="scale-balanced" href="/comparisons/security-tradeoffs">
-    Understand security vs performance trade-offs
-  </Card>
-</CardGroup>
+While videos are being produced, the written documentation covers everything:
 
-## Video Production Details
+- [Signer Checks](/vulnerabilities/signer-checks) — full walkthrough with code and exploit tests
+- [Owner Checks](/vulnerabilities/owner-checks) — fake account attacks explained
+- [Type Cosplay](/vulnerabilities/type-cosplay) — discriminator validation deep dive
+- [Arbitrary CPI](/vulnerabilities/arbitrary-cpi) — CPI target validation
+- [PDA Sharing](/vulnerabilities/pda-sharing) — PDA seed derivation patterns
+- [Reinitialization Attacks](/vulnerabilities/reinitialization-attacks) — initialization guard patterns
 
-<AccordionGroup>
-  <Accordion title="Recording Software">
-    **Primary:** OBS Studio (free, professional-grade)
-    - 1920x1080 resolution
-    - 60 FPS for smooth screen recording
-    - Multiple scene layouts (full screen, picture-in-picture)
+Clone the repository and run `npm test` to see live exploits in your terminal:
 
-    **Alternative:** Loom (quick recording and hosting)
-    - Easy sharing and embedding
-    - Automatic transcription
-    - Built-in editing tools
-  </Accordion>
-
-  <Accordion title="Code Setup">
-    **IDE:** VS Code with:
-    - Rust Analyzer extension
-    - Solana extension pack
-    - Dark theme for readability (One Dark Pro or Dracula)
-    - Font: Fira Code or JetBrains Mono (ligatures enabled)
-    - Font size: 14-16pt for screen recording clarity
-
-    **Terminal:**
-    - iTerm2 or Hyper terminal
-    - Oh My Zsh with git plugin
-    - Syntax highlighting enabled
-    - Font size: 14pt minimum
-  </Accordion>
-
-  <Accordion title="Editing Process">
-    **Post-Production:**
-    - Add chapter markers for easy navigation
-    - Include captions/subtitles for accessibility
-    - Add on-screen code highlights for key lines
-    - Background music during intro/outro (low volume)
-    - Custom thumbnail with vulnerability name + framework logos
-
-    **Optimization:**
-    - Export at 1080p with H.264 codec
-    - Upload to YouTube with proper SEO (title, description, tags)
-    - Create timestamps in description
-    - Add cards linking to related vulnerabilities
-  </Accordion>
-
-  <Accordion title="Publishing Strategy">
-    **YouTube Channel:**
-    - Channel name: "Solana Security Reference"
-    - Playlist: "Security Vulnerability Deep Dives"
-    - Organized by severity (Critical → Medium)
-
-    **Promotion:**
-    - Share on Solana Discord, Reddit, Twitter
-    - Cross-post to SuperteamNG community
-    - Embed in documentation (this page!)
-    - Update video IDs after upload
-  </Accordion>
-</AccordionGroup>
-
-## Video Scripts Available Now
-
-<Note>
-**Status:** All scripts completed and ready for production
-
-**Available Scripts:**
-- Main Course Deep Dive (`solana-security-deep-dive-main-course.md`)
-- Signer Checks Walkthrough (`signer-checks-walkthrough.md`)
-- Owner Checks Walkthrough (`owner-checks-walkthrough.md`)
-- Type Cosplay Walkthrough (`type-cosplay-walkthrough.md`)
-- Arbitrary CPI Walkthrough (`arbitrary-cpi-walkthrough.md`)
-- PDA Sharing Walkthrough (`pda-sharing-walkthrough.md`)
-- Reinitialization Attacks Walkthrough (`reinitialization-attacks-walkthrough.md`)
-- Quick Reference Guide (comprehensive written guide)
-
-**Location:** `video scripts/` directory in the repository
-
-**How to Stay Updated on Video Production:**
-- ⭐ Star the [GitHub repository](https://github.com/superteamng/solana-security-reference)
-- 🔔 Subscribe to the YouTube channel (link TBA)
-- 🐦 Follow [@superteamng](https://twitter.com/superteamng) on Twitter
-
-**Want to help?** If you'd like to contribute to video production, translations, or additional content, open an issue on GitHub!
-</Note>
-
-## Temporary Alternatives
-
-While videos are being produced, you can learn through:
-
-<CardGroup cols={2}>
-  <Card title="Written Guides" icon="book" href="/vulnerabilities/signer-checks">
-    Comprehensive documentation with code examples and diagrams for all vulnerabilities
-  </Card>
-  <Card title="Interactive Tests" icon="terminal" href="https://github.com/superteamng/solana-security-reference/tree/main/tests">
-    Clone the repo and run `npm test` to see live exploits in your terminal
-  </Card>
-  <Card title="Source Code" icon="code" href="https://github.com/superteamng/solana-security-reference/tree/main/programs">
-    Read the heavily-commented vulnerable and secure implementations directly
-  </Card>
-  <Card title="Mermaid Diagrams" icon="diagram-project" href="/vulnerabilities/signer-checks">
-    Interactive sequence diagrams showing attack flows on every vulnerability page
-  </Card>
-</CardGroup>
-
----
-
-<Tip>
-**Have questions about the content?** Open a GitHub issue or discussion, and we'll address it in the video series!
-</Tip>
+```bash
+git clone https://github.com/danielAsaboro/solana_badger
+cd solana_badger
+npm install
+npm test
+```

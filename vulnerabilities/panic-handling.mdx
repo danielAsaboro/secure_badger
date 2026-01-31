@@ -1,0 +1,461 @@
+---
+title: "Panic / Error Handling"
+description: "How unwrap(), direct indexing, and division by zero cause denial-of-service in Solana programs"
+icon: "bomb"
+---
+
+What happens when your program calls `.unwrap()` on untrusted input? It panics, the transaction aborts, and the attacker grins.
+
+## What we will build
+
+- A **vulnerable** Anchor program with three distinct panic vectors (`.unwrap()`, direct indexing, bare division)
+- A **test suite** that triggers each panic and proves the DoS
+- A **secure** version that replaces every panic path with checked operations and custom errors
+
+<Note>
+This tutorial assumes you have the [solana_badger](https://github.com/danielAsaboro/solana_badger) repo cloned, dependencies installed, and `anchor build` passing. See [Run it yourself](#run-it-yourself) at the bottom if you need setup steps.
+</Note>
+
+## The vulnerable program -- Anchor
+
+We start with the account state. This file is identical in both the vulnerable and secure versions.
+
+```rust state.rs
+use anchor_lang::prelude::*;
+
+#[account]
+pub struct ProcessorState {
+    pub authority: Pubkey,
+    pub data: Vec<u64>,
+    pub total: u64,
+}
+
+impl ProcessorState {
+    pub const LEN: usize = 8 + 32 + 4 + (10 * 8) + 8;
+}
+```
+
+Notice that `ProcessorState` is straightforward: a pubkey, a vector of up to 10 `u64` values, and a running total.
+
+Now the instruction handler in `lib.rs`:
+
+```rust lib.rs
+use anchor_lang::prelude::*;
+
+declare_id!("A5QPcpmFYpkPQdPNhv92vXUZRGWMDsmy1HAy6dj2xKjr");
+
+pub mod state;
+use state::ProcessorState;
+
+#[program]
+pub mod vulnerable_panic_handling {
+    use super::*;
+
+    pub fn process_data(ctx: Context<ProcessData>, values: Vec<u64>, divisor: u64) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+
+        let first = values.first().unwrap();
+        let last = values[values.len() - 1];
+        let average = (first + last) / divisor;
+
+        state.data = values;
+        state.total = average;
+
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct ProcessData<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = ProcessorState::LEN,
+        seeds = [b"processor", authority.key().as_ref()],
+        bump
+    )]
+    pub state: Account<'info, ProcessorState>,
+
+    pub system_program: Program<'info, System>,
+}
+```
+
+Three lines, three panic vectors:
+
+```rust
+let first = values.first().unwrap();       // panics if values is empty
+let last = values[values.len() - 1];       // panics if values is empty (underflow on len() - 1)
+let average = (first + last) / divisor;    // panics if divisor is 0
+```
+
+An attacker only needs to pass an empty `Vec` or a zero `divisor` to crash the program.
+
+## Exploiting it
+
+We set up the test harness first -- provider, programs, a funded user, and the PDA derivation:
+
+```typescript
+import * as anchor from "@coral-xyz/anchor";
+import { PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
+import { assert } from "chai";
+import BN from "bn.js";
+import type { VulnerablePanicHandling } from "../target/types/vulnerable_panic_handling";
+
+const provider = anchor.AnchorProvider.env();
+anchor.setProvider(provider);
+
+const vulnerableProgram: anchor.Program<VulnerablePanicHandling> =
+  anchor.workspace.VulnerablePanicHandling;
+
+const user = Keypair.generate();
+
+const [vulnStatePda] = PublicKey.findProgramAddressSync(
+  [Buffer.from("processor"), user.publicKey.toBuffer()],
+  vulnerableProgram.programId
+);
+```
+
+Nothing surprising here. Now we trigger the first panic -- an empty values vector:
+
+```typescript
+try {
+  await vulnerableProgram.methods
+    .processData([], new BN(1))
+    .accounts({
+      authority: user.publicKey,
+      state: vulnStatePda,
+      systemProgram: SystemProgram.programId,
+    })
+    .signers([user])
+    .rpc();
+} catch (error: any) {
+  console.log("Error:", error.message.substring(0, 100));
+}
+```
+
+You will see the transaction fail with a panic message like:
+
+```
+PANIC CONFIRMED: Program crashed!
+Error: ... panicked at 'called `Option::unwrap()` on a `None` value' ...
+```
+
+Notice that the error is opaque -- no custom error code, no hint about which input was wrong.
+
+Next, we trigger the division-by-zero panic with valid values but `divisor = 0`:
+
+```typescript
+try {
+  await vulnerableProgram.methods
+    .processData([new BN(10), new BN(20)], new BN(0))
+    .accounts({
+      authority: user.publicKey,
+      state: vulnStatePda,
+      systemProgram: SystemProgram.programId,
+    })
+    .signers([user])
+    .rpc();
+} catch (error: any) {
+  console.log("Error:", error.message.substring(0, 100));
+}
+```
+
+You will see:
+
+```
+PANIC CONFIRMED: Program crashed!
+Error: ... attempt to divide by zero ...
+```
+
+Both attacks cost the caller nothing but a failed transaction. The program burns compute units and returns no actionable diagnostic.
+
+## The fix -- Anchor
+
+We replace every panic-inducing operation with a checked alternative and define a `PanicError` enum for custom error codes:
+
+```rust lib.rs (secure)
+use anchor_lang::prelude::*;
+
+declare_id!("BCaMVsHMzC2yT9S6fxEjnWHL7tm2VFk9jMetawEgTh4t");
+
+pub mod state;
+use state::ProcessorState;
+
+#[program]
+pub mod secure_panic_handling {
+    use super::*;
+
+    pub fn process_data(ctx: Context<ProcessData>, values: Vec<u64>, divisor: u64) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+
+        let first = values.first().ok_or(PanicError::EmptyValues)?;
+        let last = values.get(values.len().wrapping_sub(1))
+            .ok_or(PanicError::EmptyValues)?;
+
+        let sum = first.checked_add(*last).ok_or(PanicError::Overflow)?;
+        let average = sum.checked_div(divisor).ok_or(PanicError::DivisionByZero)?;
+
+        state.data = values;
+        state.total = average;
+
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct ProcessData<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = ProcessorState::LEN,
+        seeds = [b"processor", authority.key().as_ref()],
+        bump
+    )]
+    pub state: Account<'info, ProcessorState>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[error_code]
+pub enum PanicError {
+    #[msg("Cannot process empty values")]
+    EmptyValues,
+    #[msg("Division by zero")]
+    DivisionByZero,
+    #[msg("Integer overflow")]
+    Overflow,
+}
+```
+
+The diff that matters:
+
+```diff
+- let first = values.first().unwrap();
++ let first = values.first().ok_or(PanicError::EmptyValues)?;
+
+- let last = values[values.len() - 1];
++ let last = values.get(values.len().wrapping_sub(1))
++     .ok_or(PanicError::EmptyValues)?;
+
+- let average = (first + last) / divisor;
++ let sum = first.checked_add(*last).ok_or(PanicError::Overflow)?;
++ let average = sum.checked_div(divisor).ok_or(PanicError::DivisionByZero)?;
+```
+
+Notice that `.ok_or()` converts `None` into a custom `Err` that propagates through Anchor's `?` operator. `checked_div()` returns `None` when the divisor is zero instead of panicking. Every failure path now returns a named error code.
+
+When we run the secure tests with the same exploit inputs, we see clean rejections:
+
+```
+FIX CONFIRMED: Graceful error returned!
+Error: ... Cannot process empty values ...
+
+FIX CONFIRMED: Graceful error returned!
+Error: ... Division by zero ...
+```
+
+The transaction still fails, but now callers get a specific error code they can match on. No panic, no wasted compute.
+
+## The vulnerable program -- Pinocchio
+
+Without Anchor's deserialization layer, the panic surface area is larger. Here are the key vulnerable lines from the Pinocchio `process_instruction` and `process` functions:
+
+```rust
+// Entrypoint -- panics if instruction_data is empty
+let instruction = instruction_data[0];
+```
+
+```rust
+// process() -- panics if fewer than 2 accounts
+let authority_info = &accounts[0];
+let state_info = &accounts[1];
+
+// panics if instruction_data is too short
+let divisor = instruction_data[1] as u64;
+let count = instruction_data[2] as usize;
+
+// inner loop -- panics on out-of-bounds slice, .unwrap() on conversion
+let value_bytes = &instruction_data[offset..offset + 8];
+let value = u64::from_le_bytes(value_bytes.try_into().unwrap());
+total = total + value;
+
+// panics if divisor is 0
+let average = total / divisor;
+```
+
+In Pinocchio's `no_std` environment, a panic enters the `loop {}` handler. The BPF runtime eventually kills the program for exceeding compute limits -- same result, worse diagnostics.
+
+## The fix -- Pinocchio
+
+Every direct index becomes `.get()` or `.first()`, every `.unwrap()` becomes `.map_err()`, and every bare operator becomes its `checked_` variant:
+
+```rust
+// Entrypoint -- returns error instead of panicking
+let instruction = instruction_data.first()
+    .ok_or(ProgramError::InvalidInstructionData)?;
+```
+
+```rust
+// process() -- bounds-checked account access
+let authority_info = accounts.get(0)
+    .ok_or(ProgramError::NotEnoughAccountKeys)?;
+let state_info = accounts.get(1)
+    .ok_or(ProgramError::NotEnoughAccountKeys)?;
+
+// bounds-checked data access
+let divisor = *instruction_data.get(1)
+    .ok_or(ProgramError::InvalidInstructionData)? as u64;
+let count = *instruction_data.get(2)
+    .ok_or(ProgramError::InvalidInstructionData)? as usize;
+
+// inner loop -- bounds-checked slice, proper error propagation, checked addition
+let end = offset.checked_add(8)
+    .ok_or(ProgramError::InvalidInstructionData)?;
+let value_bytes = instruction_data.get(offset..end)
+    .ok_or(ProgramError::InvalidInstructionData)?;
+let value_array: [u8; 8] = value_bytes.try_into()
+    .map_err(|_| ProgramError::InvalidInstructionData)?;
+let value = u64::from_le_bytes(value_array);
+total = total.checked_add(value)
+    .ok_or(ProgramError::ArithmeticOverflow)?;
+
+// checked division
+let average = total.checked_div(divisor)
+    .ok_or(ProgramError::InvalidArgument)?;
+```
+
+Notice that Pinocchio uses `ProgramError` variants (e.g., `NotEnoughAccountKeys`, `InvalidInstructionData`, `ArithmeticOverflow`) instead of a custom error enum. Every failure path returns immediately with a specific error code.
+
+## Side-by-side comparison
+
+<Tabs>
+  <Tab title="Anchor">
+    <CodeGroup>
+    ```rust Vulnerable
+    pub fn process_data(ctx: Context<ProcessData>, values: Vec<u64>, divisor: u64) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+
+        let first = values.first().unwrap();
+        let last = values[values.len() - 1];
+        let average = (first + last) / divisor;
+
+        state.data = values;
+        state.total = average;
+        Ok(())
+    }
+    ```
+
+    ```rust Secure
+    pub fn process_data(ctx: Context<ProcessData>, values: Vec<u64>, divisor: u64) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+
+        let first = values.first().ok_or(PanicError::EmptyValues)?;
+        let last = values.get(values.len().wrapping_sub(1))
+            .ok_or(PanicError::EmptyValues)?;
+
+        let sum = first.checked_add(*last).ok_or(PanicError::Overflow)?;
+        let average = sum.checked_div(divisor).ok_or(PanicError::DivisionByZero)?;
+
+        state.data = values;
+        state.total = average;
+        Ok(())
+    }
+    ```
+    </CodeGroup>
+  </Tab>
+  <Tab title="Pinocchio">
+    <CodeGroup>
+    ```rust Vulnerable
+    let instruction = instruction_data[0];
+
+    let authority_info = &accounts[0];
+    let state_info = &accounts[1];
+    let divisor = instruction_data[1] as u64;
+
+    let value_bytes = &instruction_data[offset..offset + 8];
+    let value = u64::from_le_bytes(value_bytes.try_into().unwrap());
+    total = total + value;
+
+    let average = total / divisor;
+    ```
+
+    ```rust Secure
+    let instruction = instruction_data.first()
+        .ok_or(ProgramError::InvalidInstructionData)?;
+
+    let authority_info = accounts.get(0)
+        .ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let state_info = accounts.get(1)
+        .ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let divisor = *instruction_data.get(1)
+        .ok_or(ProgramError::InvalidInstructionData)? as u64;
+
+    let end = offset.checked_add(8)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let value_bytes = instruction_data.get(offset..end)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let value_array: [u8; 8] = value_bytes.try_into()
+        .map_err(|_| ProgramError::InvalidInstructionData)?;
+    let value = u64::from_le_bytes(value_array);
+    total = total.checked_add(value)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    let average = total.checked_div(divisor)
+        .ok_or(ProgramError::InvalidArgument)?;
+    ```
+    </CodeGroup>
+  </Tab>
+</Tabs>
+
+## Key takeaways
+
+- **Every `.unwrap()` is a DoS vector.** Replace with `.ok_or(CustomError)?` everywhere.
+- **Direct indexing (`data[i]`) panics on untrusted input.** Use `.get(i)` instead -- it returns `Option<&T>`.
+- **Bare arithmetic operators panic on edge cases.** Use `checked_div()`, `checked_add()`, `checked_sub()`, and `checked_mul()` for all user-supplied values.
+- **Panics waste compute and produce opaque errors.** Graceful errors return a specific code the caller can match on.
+- **In Pinocchio, you are the safety net.** Anchor deserializes for you; Pinocchio does not. Every byte must be bounds-checked.
+
+## Run it yourself
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/danielAsaboro/solana_badger.git
+    cd solana_badger
+    ```
+  </Step>
+  <Step title="Install dependencies">
+    ```bash
+    npm install
+    ```
+  </Step>
+  <Step title="Build the Anchor programs">
+    ```bash
+    anchor build
+    ```
+    You will see both `vulnerable_panic_handling` and `secure_panic_handling` compile.
+  </Step>
+  <Step title="Run the Anchor panic-handling tests">
+    ```bash
+    anchor test -- --grep "Panic Handling"
+    ```
+    You will see two `PANIC CONFIRMED` results from the vulnerable program, followed by two `FIX CONFIRMED` results from the secure program, and two passing valid-input tests.
+  </Step>
+  <Step title="Run the Pinocchio panic-handling tests">
+    ```bash
+    npx ts-mocha -p ./tsconfig.json -t 1000000 tests/pinocchio/panic-handling.pinocchio.test.ts
+    ```
+    You will see the same pattern: panics from the vulnerable version, clean errors from the secure version.
+  </Step>
+</Steps>
+
+<Note>
+The full source for both vulnerable and secure implementations lives at
+[`programs/panic-handling/`](https://github.com/danielAsaboro/solana_badger/tree/main/programs/panic-handling) in the repository.
+</Note>

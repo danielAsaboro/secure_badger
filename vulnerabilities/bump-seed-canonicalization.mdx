@@ -1,0 +1,412 @@
+---
+title: "Bump Seed Canonicalization"
+description: "How accepting non-canonical PDA bumps enables alternate address derivation attacks"
+icon: "seedling"
+---
+
+What happens when your program accepts any valid bump instead of only the canonical one?
+
+## What we will build
+
+- **A vulnerable vault program** that accepts any valid PDA bump, letting an attacker derive alternate addresses from the same seeds
+- **An exploit test** that demonstrates how a non-canonical bump bypasses uniqueness assumptions
+- **A secure vault program** that pins every PDA operation to the stored canonical bump
+
+<Note>
+**Prerequisites:** This tutorial assumes familiarity with Solana PDAs, Anchor's `seeds` and `bump` constraints, and basic Rust. We also show a Pinocchio (no-framework) equivalent.
+</Note>
+
+## The vulnerable program -- Anchor
+
+We begin with account state. Our vault stores the user's pubkey, a balance, and the bump used during initialization:
+
+```rust state.rs
+use anchor_lang::prelude::*;
+
+#[account]
+pub struct VaultState {
+    pub user: Pubkey,
+    pub balance: u64,
+    pub bump: u8,
+}
+
+impl VaultState {
+    pub const LEN: usize = 8 + 32 + 8 + 1; // discriminator + pubkey + u64 + u8
+}
+```
+
+Notice that we reserve one byte for `bump`. We will store the canonical bump here during initialization and rely on it later.
+
+Next, the `initialize` instruction. Anchor's `bumps` map always returns the canonical (highest valid) bump:
+
+```rust initialize.rs
+use anchor_lang::prelude::*;
+use crate::state::VaultState;
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(
+        init,
+        payer = user,
+        space = VaultState::LEN,
+        seeds = [b"vault", user.key().as_ref()],
+        bump
+    )]
+    pub vault: Account<'info, VaultState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+
+    vault.user = ctx.accounts.user.key();
+    vault.balance = 0;
+    vault.bump = ctx.bumps.vault;
+
+    msg!("Vault initialized for user: {}", vault.user);
+    msg!("Canonical bump: {}", vault.bump);
+
+    Ok(())
+}
+```
+
+You will see the canonical bump logged -- typically 255 or a value close to it.
+
+Now the vulnerable `withdraw` instruction. It accepts a `bump` parameter from the caller and uses a bare `bump` constraint:
+
+```rust withdraw.rs (vulnerable)
+use anchor_lang::prelude::*;
+use crate::state::VaultState;
+
+#[derive(Accounts)]
+#[instruction(bump: u8)]
+pub struct Withdraw<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", user.key().as_ref()],
+        bump  // accepts ANY valid bump, not just the canonical one
+    )]
+    pub vault: Account<'info, VaultState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+}
+
+pub fn withdraw(ctx: Context<Withdraw>, bump: u8) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+
+    msg!("Withdrawing from vault with bump: {}", bump);
+    msg!("Vault balance: {}", vault.balance);
+
+    Ok(())
+}
+```
+
+The bug is on one line: `bump` without `= vault.bump`. This tells Anchor "verify this PDA is valid" but not "verify this is the *canonical* PDA." Multiple bump values can produce valid-but-different PDAs from the same seeds.
+
+The program dispatcher ties the pieces together:
+
+```rust lib.rs
+use anchor_lang::prelude::*;
+
+declare_id!("EhLoKK5wYMoU95ibhc6ErhmAb9ELkLTWvqyeJBMAmpx2");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod vulnerable_bump_seed_canonicalization {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        instructions::initialize(ctx)
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>, bump: u8) -> Result<()> {
+        instructions::withdraw(ctx, bump)
+    }
+}
+```
+
+## Exploiting it
+
+An attacker who discovers a non-canonical bump that also produces a valid PDA for the same seeds can call `withdraw` with that bump. Because the program never compares the provided bump against the stored canonical bump, the instruction succeeds.
+
+```typescript
+// Attacker finds a non-canonical bump that produces a valid PDA
+const nonCanonicalBump = 253; // any valid bump other than the canonical one
+const [altPda] = PublicKey.createProgramAddressSync(
+  [Buffer.from("vault"), user.publicKey.toBuffer(), Buffer.from([nonCanonicalBump])],
+  program.programId,
+);
+
+// This call should fail, but the vulnerable program accepts it
+await program.methods
+  .withdraw(nonCanonicalBump)
+  .accounts({ vault: altPda, user: user.publicKey })
+  .signers([user])
+  .rpc();
+```
+
+You will see the transaction succeed even though the attacker used a non-canonical bump. This breaks the "one PDA per seed set" assumption, enabling duplicate accounts, phantom state, or bypassed uniqueness constraints.
+
+## The fix -- Anchor
+
+We pin the constraint to the stored canonical bump and remove the user-supplied `bump` parameter:
+
+```rust withdraw.rs (secure)
+use anchor_lang::prelude::*;
+use crate::state::VaultState;
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", user.key().as_ref()],
+        bump = vault.bump  // only the stored canonical bump is accepted
+    )]
+    pub vault: Account<'info, VaultState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+}
+
+pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+    let vault = &mut ctx.accounts.vault;
+
+    msg!("Withdrawing from vault with canonical bump: {}", vault.bump);
+    msg!("Vault balance: {}", vault.balance);
+
+    Ok(())
+}
+```
+
+The secure dispatcher no longer accepts a `bump` argument:
+
+```rust lib.rs (secure)
+use anchor_lang::prelude::*;
+
+declare_id!("5RmCKP8aNEDVdDPJwJXUn4icVzq4jti72kSfiBiJj9CJ");
+
+pub mod instructions;
+pub mod state;
+
+pub use instructions::*;
+pub use state::*;
+
+#[program]
+pub mod secure_bump_seed_canonicalization {
+    use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        instructions::initialize(ctx)
+    }
+
+    pub fn withdraw(ctx: Context<Withdraw>) -> Result<()> {
+        instructions::withdraw(ctx)
+    }
+}
+```
+
+The entire fix is two steps:
+
+<Steps>
+  <Step title="Store the canonical bump at initialization">
+    `vault.bump = ctx.bumps.vault` -- Anchor's `bumps` map always returns the canonical (highest valid) bump.
+  </Step>
+  <Step title="Enforce the stored bump on every subsequent use">
+    Change `bump` to `bump = vault.bump`. Anchor re-derives the PDA using the stored canonical bump and rejects any other value.
+  </Step>
+</Steps>
+
+Here is the critical diff:
+
+<CodeGroup>
+```rust Vulnerable
+#[derive(Accounts)]
+#[instruction(bump: u8)]
+pub struct Withdraw<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", user.key().as_ref()],
+        bump  // accepts any valid bump
+    )]
+    pub vault: Account<'info, VaultState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+}
+```
+
+```rust Secure
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(
+        mut,
+        seeds = [b"vault", user.key().as_ref()],
+        bump = vault.bump  // only canonical bump accepted
+    )]
+    pub vault: Account<'info, VaultState>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+}
+```
+</CodeGroup>
+
+Notice that the `#[instruction(bump: u8)]` attribute is gone in the secure version -- the program no longer trusts client-supplied bumps at all.
+
+## The vulnerable program -- Pinocchio
+
+In the Pinocchio (no-framework) implementation, we derive PDAs manually. The vulnerable `withdraw` function reads a bump from instruction data and calls `create_program_address` without comparing it to the stored canonical bump:
+
+```rust lib.rs (vulnerable pinocchio) -- key lines
+fn withdraw(accounts: &[AccountView], bump: u8) -> ProgramResult {
+    let vault = &accounts[0];
+    let user = &accounts[1];
+
+    if !user.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let user_bytes = user.address().as_ref();
+    let seeds: &[&[u8]] = &[b"vault", user_bytes, &[bump]];
+
+    let derived = create_program_address(seeds, ID.as_ref())?;
+
+    if vault.address() != &derived {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Reads vault state but never checks bump against vault_state.bump
+    let vault_data = vault.try_borrow()?;
+    let _vault_state = VaultState::deserialize(&vault_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    Ok(())
+}
+```
+
+The address comparison passes for any bump that produces a valid PDA. Since we never read `vault_state.bump` for comparison, a non-canonical bump sails through.
+
+## The fix -- Pinocchio
+
+We add a single guard: deserialize first, then compare the caller-supplied bump against the stored canonical bump before proceeding.
+
+```rust lib.rs (secure pinocchio) -- key lines
+fn withdraw(accounts: &[AccountView], bump: u8) -> ProgramResult {
+    let vault = &accounts[0];
+    let user = &accounts[1];
+
+    if !user.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Read vault state FIRST to get the stored canonical bump
+    let vault_data = vault.try_borrow()?;
+    let vault_state = VaultState::deserialize(&vault_data)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    // Reject any bump that doesn't match the canonical one
+    if bump != vault_state.bump {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Now derive and verify the PDA with the canonical bump
+    let user_bytes = user.address().as_ref();
+    let seeds: &[&[u8]] = &[b"vault", user_bytes, &[bump]];
+    let derived = create_program_address(seeds, ID.as_ref())?;
+
+    if vault.address() != &derived {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    Ok(())
+}
+```
+
+You will see that a non-canonical bump now produces `ProgramError::InvalidSeeds` before we even reach the PDA derivation.
+
+## Side-by-side comparison
+
+<Tabs>
+  <Tab title="Anchor">
+    **Vulnerable:**
+    ```rust
+    #[account(
+        mut,
+        seeds = [b"vault", user.key().as_ref()],
+        bump  // any valid bump accepted
+    )]
+    ```
+
+    **Secure:**
+    ```rust
+    #[account(
+        mut,
+        seeds = [b"vault", user.key().as_ref()],
+        bump = vault.bump  // only canonical bump accepted
+    )]
+    ```
+  </Tab>
+
+  <Tab title="Pinocchio">
+    **Vulnerable:**
+    ```rust
+    let seeds: &[&[u8]] = &[b"vault", user_bytes, &[bump]];
+    let derived = create_program_address(seeds, ID.as_ref())?;
+    // never checks bump against stored value
+    ```
+
+    **Secure:**
+    ```rust
+    if bump != vault_state.bump {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let seeds: &[&[u8]] = &[b"vault", user_bytes, &[bump]];
+    let derived = create_program_address(seeds, ID.as_ref())?;
+    ```
+  </Tab>
+</Tabs>
+
+## Key takeaways
+
+- **Store the canonical bump at init, enforce it everywhere else.** `find_program_address` returns the highest valid bump (255 downward). Save it and never trust client input.
+- **In Anchor, use `bump = account.stored_bump`, not bare `bump`.** Bare `bump` verifies validity but not canonicality.
+- **In Pinocchio, compare the caller-supplied bump against the stored bump before calling `create_program_address`.** No framework shortcut exists -- the check must be explicit.
+- **Non-canonical bumps produce different addresses.** Same seeds + different bump = different PDA. If your program assumes "one PDA per seed set," accepting non-canonical bumps breaks that assumption.
+
+<Warning>
+Even if only one non-canonical bump is valid for a given seed set, that is enough to create a second account with the same logical identity. Programs that use PDAs as unique identifiers must enforce canonical bumps.
+</Warning>
+
+## Run it yourself
+
+<Steps>
+  <Step title="Clone and install">
+    ```bash
+    git clone https://github.com/danielAsaboro/solana_badger
+    cd solana_badger
+    npm install
+    ```
+  </Step>
+  <Step title="Run the Anchor tests">
+    ```bash
+    anchor test -- --grep "Bump Seed"
+    ```
+    You will see the vulnerable program accept a non-canonical bump, and the secure program reject it with a constraint violation.
+  </Step>
+  <Step title="Run the Pinocchio tests">
+    ```bash
+    npx jest tests/pinocchio/bump-seed-canonicalization.pinocchio.test.ts
+    ```
+    You will see the secure version return `InvalidSeeds` when given a non-canonical bump.
+  </Step>
+</Steps>

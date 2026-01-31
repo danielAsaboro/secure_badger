@@ -1,0 +1,237 @@
+---
+title: "Dependency Security"
+description: "Supply chain risks from outdated crates, typosquatting, and malicious dependencies"
+icon: "box"
+---
+
+What happens when a crate in your dependency tree is compromised?
+
+## The vulnerability in 30 seconds
+
+**Severity: VARIABLE (LOW to CRITICAL).** Every `cargo build` pulls in dozens of transitive dependencies. A single compromised crate -- whether through typosquatting, account takeover, or a malicious update -- can inject arbitrary code into your on-chain program. Unlike runtime vulnerabilities that require specific account inputs to exploit, a supply chain attack executes during compilation and can embed backdoors, exfiltrate keys, or alter program logic invisibly. The Solana ecosystem's reliance on a concentrated set of crates (`anchor-lang`, `spl-token`, `borsh`, `solana-program`) means a single upstream compromise has an outsized blast radius. This is not a code vulnerability you can see in a diff -- it is a process vulnerability that requires tooling, discipline, and vigilance.
+
+## Why this matters for Solana programs
+
+Solana programs are compiled to BPF bytecode and deployed on-chain. Once deployed, the bytecode runs deterministically. But the supply chain attack happens *before* deployment, during the build step. A compromised dependency can:
+
+- **Alter program logic at compile time** via procedural macros or build scripts (`build.rs`). A malicious `build.rs` can modify source files, inject additional instructions, or phone home during compilation.
+- **Introduce subtle backdoors** that are invisible in your source code. A patched version of `borsh` could deserialize attacker-controlled data as valid, or a modified `anchor-lang` proc macro could skip discriminator checks for specific account patterns.
+- **Exfiltrate secrets during CI/CD.** Build scripts have full access to the build environment, including environment variables, filesystem, and network. A compromised dependency can steal deployer keypairs during `anchor build`.
+
+<Warning>
+Unlike web applications where you can patch and redeploy instantly, a compromised Solana program requires a program upgrade transaction signed by the upgrade authority. If the authority keypair was exfiltrated during the build, the attacker can front-run your upgrade or revoke it entirely.
+</Warning>
+
+## Attack vectors
+
+### Typosquatting
+
+An attacker publishes a crate with a name similar to a popular dependency:
+
+| Legitimate crate | Typosquat example |
+|---|---|
+| `anchor-lang` | `anchor_lang` (underscore vs hyphen) |
+| `spl-token` | `spl_tokens` (plural) |
+| `solana-program` | `solana-progam` (missing letter) |
+| `borsh` | `borsh-rs` (suffix added) |
+
+A single character difference in `Cargo.toml` pulls in the malicious crate. Cargo resolves crate names case-insensitively and normalizes hyphens/underscores, but deliberate misspellings bypass this.
+
+### Malicious updates
+
+A legitimate crate maintainer's account is compromised, or a maintainer goes rogue. A new patch version is published with malicious code. Because most `Cargo.toml` files use caret requirements (`^0.29`), a `cargo update` silently pulls in the compromised patch.
+
+### Transitive dependency poisoning
+
+Your program depends on crate A, which depends on crate B, which depends on crate C. Even if you audit A and B, a compromised C executes with full build-time permissions. The `solana-program` crate alone pulls in over 50 transitive dependencies.
+
+## Defenses
+
+### 1. Pin exact versions
+
+<Tabs>
+  <Tab title="Vulnerable Cargo.toml">
+    ```toml
+    [dependencies]
+    anchor-lang = "0.29"           # Accepts 0.29.x (any patch)
+    anchor-spl = "0.29"            # Same problem
+    solana-program = "~1.17"       # Accepts 1.17.x
+    borsh = "*"                    # Accepts ANY version
+    ```
+
+    Caret (`^`) and tilde (`~`) requirements accept future patch and minor versions automatically. A `cargo update` or fresh `cargo build` on a new machine may resolve to a different (potentially compromised) version than what you tested.
+  </Tab>
+
+  <Tab title="Secure Cargo.toml">
+    ```toml
+    [dependencies]
+    anchor-lang = "=0.29.0"        # Exact version only
+    anchor-spl = "=0.29.0"         # Exact version only
+    solana-program = "=1.17.28"    # Exact version only
+    borsh = "=1.3.1"               # Exact version only
+    ```
+
+    The `=` prefix pins to an exact version. No patch updates are accepted without an explicit change to `Cargo.toml`. This means you must manually update versions, but every update is a conscious, reviewable decision.
+  </Tab>
+</Tabs>
+
+<Tip>
+If exact pinning feels too restrictive for development, use `Cargo.lock` as your pin mechanism. Commit `Cargo.lock` to version control and run `cargo update` explicitly when you want to upgrade. In CI, use `--locked` to ensure builds use the exact locked versions.
+</Tip>
+
+### 2. Audit dependencies with cargo-audit
+
+`cargo-audit` checks your `Cargo.lock` against the [RustSec Advisory Database](https://rustsec.org/) for known vulnerabilities.
+
+<Steps>
+  <Step title="Install cargo-audit">
+    ```bash
+    cargo install cargo-audit
+    ```
+  </Step>
+  <Step title="Run the audit">
+    ```bash
+    cargo audit
+    ```
+    This scans `Cargo.lock` and reports any crates with known security advisories. Exit code is non-zero if vulnerabilities are found.
+  </Step>
+  <Step title="Add to CI">
+    ```yaml
+    # In your CI pipeline (GitHub Actions example)
+    - name: Security audit
+      run: |
+        cargo install cargo-audit
+        cargo audit
+    ```
+    Run `cargo audit` on every PR and block merges if advisories are found.
+  </Step>
+  <Step title="Fix or acknowledge">
+    ```bash
+    # Update a specific vulnerable crate
+    cargo update -p vulnerable-crate
+
+    # If no fix is available, document the risk
+    # and add to cargo-audit ignore list
+    cargo audit --ignore RUSTSEC-2024-XXXX
+    ```
+  </Step>
+</Steps>
+
+### 3. Review transitive dependencies
+
+Your `Cargo.toml` may list 5 direct dependencies, but your `Cargo.lock` may contain 200+ crates. Use `cargo tree` to understand the full dependency graph:
+
+```bash
+# Show the full dependency tree
+cargo tree
+
+# Find which crates pull in a specific dependency
+cargo tree -i suspicious-crate
+
+# Show only duplicated dependencies (version conflicts)
+cargo tree --duplicates
+
+# Show dependencies with build scripts (potential attack surface)
+cargo tree --format "{p} {f}" | grep build
+```
+
+<Note>
+Pay special attention to crates with `build.rs` scripts and procedural macros. These execute arbitrary code during compilation with full access to the build environment. A compromised proc macro crate is the highest-impact supply chain vector.
+</Note>
+
+### 4. Use [patch] overrides for emergency fixes
+
+If a dependency is compromised and no fixed version is available, you can override it with a local or forked version using `[patch]` in your workspace `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+# Override a compromised crate with your audited fork
+suspicious-crate = { git = "https://github.com/your-org/suspicious-crate-fork", rev = "abc123" }
+
+# Or override with a local path during investigation
+suspicious-crate = { path = "../audited-suspicious-crate" }
+```
+
+The `[patch]` section overrides the crate resolution for the entire workspace, including transitive dependencies. This is the fastest way to remediate a supply chain issue without waiting for an upstream fix.
+
+### 5. Verify crate checksums
+
+Cargo stores checksums in `Cargo.lock`. If a crate's tarball changes on crates.io (which should never happen for a published version), `cargo build --locked` will fail with a checksum mismatch. Always use `--locked` in CI:
+
+```bash
+# CI build command - fails if Cargo.lock is stale or checksums mismatch
+cargo build-sbf --locked
+
+# Anchor equivalent
+anchor build -- --locked
+```
+
+### 6. Minimize the dependency surface
+
+Every dependency is an attack surface. Prefer crates with:
+
+- **Few transitive dependencies.** A crate that pulls in 3 dependencies is less risky than one that pulls in 30.
+- **Active maintenance.** Abandoned crates are more likely to have unpatched vulnerabilities and are targets for account takeover.
+- **No build scripts.** Crates without `build.rs` cannot execute arbitrary code at compile time.
+- **Audited source code.** For critical dependencies, read the source. For security-sensitive crates, consider vendoring them into your repository.
+
+```toml
+[dependencies]
+# Prefer feature-gated dependencies to minimize what gets compiled
+anchor-lang = { version = "=0.29.0", features = ["init-if-needed"] }
+
+# Disable default features when you only need a subset
+solana-program = { version = "=1.17.28", default-features = false }
+```
+
+## Cargo.toml best practices checklist
+
+<Tabs>
+  <Tab title="Versions">
+    - Use `=x.y.z` for all production dependencies
+    - Commit `Cargo.lock` to version control
+    - Run `cargo update` explicitly, never implicitly
+    - Use `--locked` in all CI builds
+    - Review `Cargo.lock` diffs in PRs that touch dependencies
+  </Tab>
+
+  <Tab title="Auditing">
+    - Run `cargo audit` in CI on every PR
+    - Run `cargo tree --duplicates` to find version conflicts
+    - Investigate crates with `build.rs` or proc macros
+    - Subscribe to RustSec advisories for your direct dependencies
+    - Periodically run `cargo audit --deny warnings` for stricter checking
+  </Tab>
+
+  <Tab title="Emergency response">
+    - Use `[patch.crates-io]` to override compromised crates immediately
+    - Pin to a specific `rev` in git overrides, never to a branch
+    - Vendor critical crates locally if upstream is untrusted
+    - Rotate deployer keypairs if a build-time compromise is suspected
+    - Audit deployed bytecode against a clean rebuild if supply chain attack is suspected
+  </Tab>
+</Tabs>
+
+## Real-world context
+
+The broader Rust ecosystem has seen several supply chain incidents:
+
+- **crates.io name squatting** has been an ongoing issue, with malicious crates published under names similar to popular packages.
+- **The `rustdecimal` incident (2022)** demonstrated that a crate with 1.5M+ downloads could be compromised through maintainer account takeover. The attacker published a version that exfiltrated environment variables.
+- **Build script attacks** are the most potent vector because they execute during compilation with full system access, before any sandboxing applies.
+
+For Solana specifically, the concentrated dependency on `anchor-lang` and `solana-program` means a compromise of either crate would affect thousands of deployed programs. The Solana Foundation maintains its own crate registry for core SDK crates, but third-party dependencies in the broader ecosystem remain a risk.
+
+## Key takeaways
+
+- **Supply chain attacks happen before deployment, not at runtime.** By the time your program is on-chain, the damage is already baked into the bytecode. Traditional code review of your own source files will not catch a compromised transitive dependency.
+
+- **Pin exact versions and commit `Cargo.lock`.** This is the single highest-impact defense. It ensures every build resolves to the same crate versions you tested and audited.
+
+- **Run `cargo audit` in CI, not just locally.** Advisories are published continuously. A crate that was safe last week may have a known vulnerability today. Automated CI checks catch this before deployment.
+
+- **Minimize and audit your dependency tree.** Use `cargo tree` to understand what you are actually compiling. Pay special attention to crates with build scripts and proc macros, which execute arbitrary code at compile time.
+
+- **Have an emergency response plan.** Know how to use `[patch]` overrides, how to vendor a crate locally, and how to rotate deployer keypairs. A supply chain incident requires a response measured in hours, not days.
+
+- **This is a process vulnerability, not a code vulnerability.** There is no "secure version" to show in a diff. The fix is tooling, discipline, and CI enforcement applied consistently across every build.
