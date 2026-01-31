@@ -1,0 +1,408 @@
+---
+title: "Quickstart Guide"
+description: "Get started with the Solana Security Reference in minutes"
+icon: "rocket"
+---
+
+# Quickstart Guide
+
+Get the Solana Security Reference repository running locally and start learning about Solana security vulnerabilities.
+
+## Prerequisites
+
+Before you begin, ensure you have the following installed:
+
+<AccordionGroup>
+  <Accordion icon="rust" title="Rust & Cargo">
+    Install Rust using rustup:
+    ```bash
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    source $HOME/.cargo/env
+    ```
+    Verify installation:
+    ```bash
+    rustc --version
+    cargo --version
+    ```
+  </Accordion>
+
+  <Accordion icon="link" title="Solana CLI">
+    Install the Solana CLI tools:
+    ```bash
+    sh -c "$(curl -sSfL https://release.solana.com/stable/install)"
+    ```
+    Verify installation:
+    ```bash
+    solana --version
+    ```
+    Should show version 1.18.0 or higher.
+  </Accordion>
+
+  <Accordion icon="anchor" title="Anchor Framework">
+    Install Anchor Version Manager (avm):
+    ```bash
+    cargo install --git https://github.com/coral-xyz/anchor avm --locked
+    ```
+    Install the latest Anchor version:
+    ```bash
+    avm install latest
+    avm use latest
+    ```
+    Verify installation:
+    ```bash
+    anchor --version
+    ```
+    Should show version 0.30.1 or higher.
+  </Accordion>
+
+  <Accordion icon="node-js" title="Node.js & npm">
+    Install Node.js 18+ from [nodejs.org](https://nodejs.org/) or using a version manager:
+    ```bash
+    # Using nvm (recommended)
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+    nvm install 18
+    nvm use 18
+    ```
+    Verify installation:
+    ```bash
+    node --version
+    npm --version
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Installation
+
+<Steps>
+  <Step title="Clone the Repository">
+    ```bash
+    git clone https://github.com/superteamng/solana-security-reference
+    cd solana-security-reference
+    ```
+  </Step>
+
+  <Step title="Install Node Dependencies">
+    ```bash
+    npm install
+    # or
+    yarn install
+    ```
+    This installs testing frameworks and dependencies for running exploit demonstrations.
+  </Step>
+
+  <Step title="Build All Programs">
+    Use the provided build script to compile all programs:
+    ```bash
+    chmod +x scripts/build-all.sh
+    ./scripts/build-all.sh
+    ```
+
+    **Expected output:**
+    ```
+    === Building Solana Security Reference Programs ===
+
+    --- Signer Checks Vulnerability ---
+    ✓ Signer Checks (Anchor Vulnerable) built successfully
+    ✓ Signer Checks (Anchor Secure) built successfully
+    ✓ Signer Checks (Pinocchio Vulnerable) built successfully
+    ✓ Signer Checks (Pinocchio Secure) built successfully
+
+    [... more programs ...]
+
+    === Build Summary ===
+    Successful builds: 24
+    All programs built successfully!
+    ```
+  </Step>
+
+  <Step title="Run Tests">
+    Execute the test suite to see vulnerabilities in action:
+    ```bash
+    npm test
+    ```
+
+    This runs automated tests that:
+    - ✅ Demonstrate exploits work on vulnerable programs
+    - ❌ Prove exploits are blocked on secure programs
+  </Step>
+</Steps>
+
+## Building Individual Programs
+
+If you want to build specific programs instead of all at once:
+
+<Tabs>
+  <Tab title="Anchor Programs">
+    ```bash
+    # Navigate to the program directory
+    cd programs/signer-checks/vulnerable/anchor
+
+    # Build with Anchor
+    anchor build
+
+    # View build artifacts
+    ls -la target/deploy/
+    ```
+  </Tab>
+
+  <Tab title="Pinocchio Programs">
+    ```bash
+    # Navigate to the program directory
+    cd programs/signer-checks/vulnerable/pinocchio
+
+    # Build with Solana BPF
+    cargo build-sbf
+
+    # View build artifacts
+    ls -la target/deploy/
+    ```
+  </Tab>
+</Tabs>
+
+## Running Tests
+
+### Run All Tests
+
+```bash
+npm test
+```
+
+### Run Specific Vulnerability Tests
+
+<CodeGroup>
+```bash Signer Checks
+npm test -- signer-checks
+```
+
+```bash Owner Checks
+npm test -- owner-checks
+```
+
+```bash Arbitrary CPI
+npm test -- arbitrary-cpi
+```
+
+```bash Reinitialization
+npm test -- reinitialization-attacks
+```
+
+```bash Type Cosplay
+npm test -- type-cosplay
+```
+
+```bash PDA Sharing
+npm test -- pda-sharing
+```
+</CodeGroup>
+
+### Watch Mode
+
+Run tests in watch mode for active development:
+
+```bash
+npm test -- --watch
+```
+
+### Verbose Output
+
+Get detailed test output including transaction logs:
+
+```bash
+npm test -- --verbose
+```
+
+## Expected Test Output
+
+When you run tests, you should see output like this:
+
+```
+Vulnerability: Missing Signer Checks
+
+  Vulnerable Implementation (Anchor)
+    ✓ should initialize account (156ms)
+    ✓ should allow attacker to steal ownership WITHOUT signature (234ms)
+    ⚠️  VULNERABILITY CONFIRMED: Exploit succeeded
+
+  Secure Implementation (Anchor)
+    ✓ should initialize account (142ms)
+    ✗ should prevent attacker from stealing ownership (187ms)
+       Error: Transaction failed - missing required signature
+    ✅ FIX CONFIRMED: Exploit blocked
+
+  Vulnerable Implementation (Pinocchio)
+    ✓ should initialize account (163ms)
+    ✓ should allow attacker to steal ownership WITHOUT signature (221ms)
+    ⚠️  VULNERABILITY CONFIRMED: Exploit succeeded
+
+  Secure Implementation (Pinocchio)
+    ✓ should initialize account (158ms)
+    ✗ should prevent attacker from stealing ownership (195ms)
+       Error: Transaction failed - missing required signature
+    ✅ FIX CONFIRMED: Exploit blocked
+
+8 passing (1.2s)
+```
+
+<Note>
+✓ = Test passed (exploit works or security check blocks it as expected)
+✗ = Expected failure (secure program correctly rejected malicious transaction)
+</Note>
+
+## Exploring the Code
+
+### Repository Structure
+
+```
+solana-security-reference/
+├── programs/                    # All Solana programs
+│   ├── signer-checks/
+│   │   ├── vulnerable/
+│   │   │   ├── anchor/          # Vulnerable Anchor implementation
+│   │   │   └── pinocchio/       # Vulnerable Pinocchio implementation
+│   │   ├── secure/
+│   │   │   ├── anchor/          # Secure Anchor implementation
+│   │   │   └── pinocchio/       # Secure Pinocchio implementation
+│   │   └── README.md            # Vulnerability-specific docs
+│   ├── owner-checks/
+│   ├── arbitrary-cpi/
+│   ├── reinitialization-attacks/
+│   ├── type-cosplay/
+│   └── pda-sharing/
+├── tests/                       # Test suites
+├── scripts/                     # Build scripts
+└── badger/docs/                 # This documentation
+```
+
+### Key Files
+
+<CardGroup cols={2}>
+  <Card title="Program Code" icon="code">
+    `programs/{vulnerability}/{version}/{framework}/src/lib.rs`
+
+    Core program logic with inline comments explaining vulnerabilities and fixes
+  </Card>
+
+  <Card title="Test Files" icon="flask">
+    `tests/{vulnerability}.test.ts`
+
+    TypeScript tests demonstrating exploits and security fixes
+  </Card>
+
+  <Card title="Build Script" icon="hammer">
+    `scripts/build-all.sh`
+
+    Automated script to build all programs at once
+  </Card>
+
+  <Card title="Documentation" icon="book">
+    `badger/docs/vulnerabilities/{name}.mdx`
+
+    Detailed explanations with diagrams and examples
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<Steps>
+  <Step title="Study Your First Vulnerability">
+    Start with the most common vulnerability:
+
+    [Learn about Missing Signer Checks](/vulnerabilities/signer-checks)
+  </Step>
+
+  <Step title="Compare Implementations">
+    Open the vulnerable and secure versions side-by-side:
+
+    ```bash
+    # Vulnerable
+    code programs/signer-checks/vulnerable/anchor/src/
+
+    # Secure
+    code programs/signer-checks/secure/anchor/src/
+    ```
+  </Step>
+
+  <Step title="Run the Exploit">
+    Execute the test to see the vulnerability in action:
+
+    ```bash
+    npm test -- signer-checks
+    ```
+  </Step>
+
+  <Step title="Experiment">
+    Modify the code and see what happens:
+    - Remove the fix from secure versions
+    - Add extra validation to vulnerable versions
+    - Create your own test cases
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Build errors with Anchor">
+    **Error:** `anchor: command not found`
+
+    **Solution:** Ensure Anchor is installed and in your PATH:
+    ```bash
+    avm install latest
+    avm use latest
+    echo 'export PATH="$HOME/.avm/bin:$PATH"' >> ~/.bashrc
+    source ~/.bashrc
+    ```
+  </Accordion>
+
+  <Accordion title="Cargo build-sbf fails">
+    **Error:** `cargo-build-sbf: command not found`
+
+    **Solution:** Ensure Solana CLI tools are installed:
+    ```bash
+    solana --version
+    # If not installed:
+    sh -c "$(curl -sSfL https://release.solana.com/stable/install)"
+    export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+    ```
+  </Accordion>
+
+  <Accordion title="Tests fail with 'Program not deployed'">
+    **Error:** `Program XYZ not deployed`
+
+    **Solution:** Ensure you've built the programs first:
+    ```bash
+    ./scripts/build-all.sh
+    ```
+  </Accordion>
+
+  <Accordion title="npm install fails">
+    **Error:** Node version incompatibility
+
+    **Solution:** Use Node.js 18 or higher:
+    ```bash
+    node --version
+    # If version is < 18:
+    nvm install 18
+    nvm use 18
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Getting Help
+
+<CardGroup cols={3}>
+  <Card title="GitHub Issues" icon="github" href="https://github.com/superteamng/solana-security-reference/issues">
+    Report bugs or ask questions
+  </Card>
+  <Card title="SuperteamNG" icon="users" href="https://superteam.fun/ng">
+    Join the community
+  </Card>
+  <Card title="Documentation" icon="book" href="/vulnerabilities/signer-checks">
+    Read the full guides
+  </Card>
+</CardGroup>
+
+---
+
+<Tip>
+Successfully built everything? Great! Start learning with the [Signer Checks vulnerability](/vulnerabilities/signer-checks).
+</Tip>

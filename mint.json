@@ -1,0 +1,122 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "almond",
+  "name": "Solana Security Reference",
+  "colors": {
+    "primary": "#14F195",
+    "light": "#9945FF",
+    "dark": "#14F195",
+    "anchors": {
+      "from": "#9945FF",
+      "to": "#14F195"
+    }
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Overview",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "index",
+              "quickstart"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Vulnerabilities",
+        "groups": [
+          {
+            "group": "🔴 Account Validation",
+            "pages": [
+              "vulnerabilities/signer-checks",
+              "vulnerabilities/owner-checks",
+              "vulnerabilities/type-cosplay"
+            ]
+          },
+          {
+            "group": "🟠 CPI Vulnerabilities",
+            "pages": [
+              "vulnerabilities/arbitrary-cpi"
+            ]
+          },
+          {
+            "group": "🟡 PDAs & Arithmetic",
+            "pages": [
+              "vulnerabilities/pda-sharing"
+            ]
+          },
+          {
+            "group": "🟢 Rust & Lifecycle",
+            "pages": [
+              "vulnerabilities/reinitialization-attacks"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Framework Comparison",
+        "groups": [
+          {
+            "group": "Analysis",
+            "pages": [
+              "comparisons/anchor-vs-pinocchio",
+              "comparisons/security-tradeoffs"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Deep Dive",
+        "groups": [
+          {
+            "group": "Video Content",
+            "pages": [
+              "videos/security-deep-dive"
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub Repository",
+          "href": "https://github.com/superteamng/solana-security-reference",
+          "icon": "github"
+        },
+        {
+          "anchor": "SuperteamNG",
+          "href": "https://superteam.fun/ng",
+          "icon": "users"
+        },
+        {
+          "anchor": "Run Tests",
+          "href": "#running-tests",
+          "icon": "flask"
+        }
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "View on GitHub",
+        "href": "https://github.com/superteamng/solana-security-reference"
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/superteamng/solana-security-reference",
+      "twitter": "https://twitter.com/superteamng"
+    }
+  }
+}
